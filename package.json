@@ -1,0 +1,81 @@
+{
+  "name": "@hakeee/module-host",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.25.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "development": "./src/index.ts",
+      "default": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./src/server/index.ts",
+      "development": "./src/server/index.ts",
+      "default": "./dist/server/index.js"
+    },
+    "./web": {
+      "types": "./src/web/index.tsx",
+      "development": "./src/web/index.tsx",
+      "default": "./dist/web/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "!src/**/*.test.ts",
+    "!src/**/*.test.tsx"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@hakeee/vault-service": "^0.2.0",
+    "@tanstack/react-query": "^5.0.0",
+    "drizzle-orm": "^0.45.0",
+    "fastify": "^5.5.0",
+    "react": "^19.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@tanstack/react-query": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    },
+    "fastify": {
+      "optional": true
+    },
+    "drizzle-orm": {
+      "optional": true
+    },
+    "@hakeee/vault-service": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@fastify/secure-session": "^8.4.1",
+    "@hakeee/vault-service": "link:../vault-service/packages/server",
+    "@tanstack/react-query": "^5.104.2",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.19.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "better-sqlite3": "^13.0.3",
+    "drizzle-kit": "^0.31.11",
+    "drizzle-orm": "^0.45.4",
+    "fastify": "^5.12.5",
+    "happy-dom": "^20.14.6",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "typescript": "^6.0.3",
+    "vitest": "^5.1.0",
+    "zod": "4.6.6"
+  }
+}

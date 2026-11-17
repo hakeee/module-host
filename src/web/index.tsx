@@ -1,0 +1,541 @@
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+  type QueryKey,
+  type UseMutationOptions,
+  type UseMutationResult,
+  type UseQueryOptions,
+  type UseQueryResult,
+} from "@tanstack/react-query";
+import {
+  Component,
+  createContext,
+  useContext,
+  useMemo,
+  useSyncExternalStore,
+  type ComponentType,
+  type MouseEvent,
+  type ReactNode,
+} from "react";
+import {
+  assertModuleId,
+  isContract,
+  operationsOf,
+  type AnyContract,
+  type EntityRef,
+  type OperationDef,
+  type OperationRef,
+  type PageRef,
+  type SlotRef,
+} from "../contract.js";
+import { ModuleCompositionError, resolveModules, visibleContracts } from "../resolve.js";
+import { validate, validateSync, type Input, type Output } from "../standardSchema.js";
+import { browserHistory, buildHref, compileRoute, matchRoute, sortRoutes, type CompiledRoute, type RouterHistory } from "./router.js";
+
+export { browserHistory, memoryHistory, type RouterHistory } from "./router.js";
+
+// --- module definitions -----------------------------------------------------------
+
+// biome-ignore lint: the "any web module" bound
+export type AnyWebModule = WebModule<any, any>;
+type Requirement = AnyWebModule | AnyContract;
+type ContractOf<R> = R extends AnyContract ? R : R extends { readonly contract: infer C } ? (C extends AnyContract ? C : never) : never;
+type OwnContract<C> = C extends AnyContract ? C : never;
+
+export type PageProps<P extends PageRef> = { params: Output<P["params"]> };
+
+type PagesOf<C> = C extends AnyContract
+  ? keyof C["pages"] extends never
+    ? { readonly pages?: Record<string, never> }
+    : { readonly pages: { readonly [K in keyof C["pages"]]: C["pages"][K] extends PageRef ? ComponentType<PageProps<C["pages"][K]>> : never } }
+  : { readonly pages?: Record<string, never> };
+
+/** Link/nav params are the parsed values (`id: number`), stringified into the path. */
+type ParamsArg<P extends PageRef> = {} extends Output<P["params"]>
+  ? { readonly params?: Output<P["params"]> }
+  : { readonly params: Output<P["params"]> };
+
+export type NavItem<P extends PageRef = PageRef> = {
+  readonly label: string;
+  readonly to: P;
+  readonly icon?: ComponentType<{ className?: string }>;
+  /** Lower first. Default 100. */
+  readonly order?: number;
+  /** Called as a hook while the nav renders, e.g. a polled count for a badge. */
+  readonly useBadge?: () => number | undefined;
+  /** Other pages that should also mark this item active (e.g. a detail page under a list item). */
+  readonly activeOn?: readonly PageRef[];
+} & ParamsArg<P>;
+
+export interface Contribution<Props = unknown> {
+  readonly slot: SlotRef<string, string, Props>;
+  readonly component: ComponentType<Props>;
+  readonly order: number;
+}
+
+/** A component for someone's slot. Props are checked against the slot's declared type. */
+export function contribute<Props>(slot: SlotRef<string, string, Props>, component: ComponentType<NoInfer<Props>>, options: { order?: number } = {}): Contribution<Props> {
+  return { slot, component, order: options.order ?? 100 };
+}
+
+export type WebModuleParts<C extends AnyContract | undefined> = PagesOf<C> & {
+  // biome-ignore lint: nav targets are validated at runtime against visible contracts
+  readonly nav?: readonly NavItem<any>[];
+  // biome-ignore lint: see above
+  readonly contributions?: readonly Contribution<any>[];
+};
+
+export interface WebModule<C extends AnyContract | undefined = AnyContract | undefined, R extends readonly Requirement[] = readonly Requirement[]> {
+  readonly kind: "web-module";
+  readonly id: string;
+  readonly contract: C;
+  readonly requires: R;
+  readonly parts: WebModuleParts<C>;
+}
+
+export interface WebModuleBuilder<C extends AnyContract | undefined, R extends readonly Requirement[]> {
+  readonly id: string;
+  readonly contract: C;
+  readonly requires: R;
+  /** Typed data hooks for this module's own contract or one it requires. Anything else is a type error. */
+  useModule<U extends ContractOf<R[number]> | OwnContract<C>>(contract: U): ContractHooks<U>;
+  /** Pages (one per page in the contract), nav entries and slot contributions. */
+  define(parts: WebModuleParts<C>): WebModule<C, R>;
+}
+
+/**
+ * Declare first, define after: components written between the two can
+ * call `mod.useModule(...)`, typed against this module's `requires`.
+ *
+ * ```tsx
+ * const mod = webModule({ contract: peopleContract, requires: [journalContract] });
+ * function PersonPage({ params }: PageProps<typeof peopleContract.pages.detail>) {
+ *   const people = mod.useModule(peopleContract);
+ *   const person = people.queries.get.useQuery({ id: params.id });
+ *   ...
+ * }
+ * export default mod.define({ pages: { detail: PersonPage } });
+ * ```
+ *
+ * A module can be all UI (pages and contributions over someone else's
+ * contract), all data (a contract whose hooks other modules use, with no
+ * pages), or both.
+ */
+export function webModule<const C extends AnyContract | undefined = undefined, const R extends readonly Requirement[] = readonly []>(decl: {
+  readonly id?: string;
+  readonly contract?: C;
+  readonly requires?: R;
+}): WebModuleBuilder<C, R> {
+  const id = decl.id ?? decl.contract?.id;
+  if (!id) throw new Error("a web module without a contract needs an id");
+  assertModuleId(id);
+  const contract = decl.contract as C;
+  const requires = (decl.requires ?? []) as R;
+  const visible = visibleContracts({ id, contract, requires });
+
+  return {
+    id,
+    contract,
+    requires,
+    useModule(target) {
+      if (!visible.has(target.id)) throw new ModuleCompositionError(`"${id}" uses contract "${target.id}" without requiring it`);
+      return useContractHooks(target);
+    },
+    define(parts) {
+      return { kind: "web-module", id, contract, requires, parts };
+    },
+  };
+}
+
+// --- data hooks ----------------------------------------------------------------
+
+type QueryHooks<O extends OperationDef> = {
+  useQuery(
+    input: Input<O["input"]>,
+    options?: Omit<UseQueryOptions<Output<O["output"]>, ModuleRpcError>, "queryKey" | "queryFn">,
+  ): UseQueryResult<Output<O["output"]>, ModuleRpcError>;
+  fetch(input: Input<O["input"]>): Promise<Output<O["output"]>>;
+  /** `[contractId, operation, input?]` - omit input to address every cached input. */
+  key(input?: Input<O["input"]>): QueryKey;
+  invalidate(input?: Input<O["input"]>): Promise<void>;
+};
+
+type CommandHooks<O extends OperationDef> = {
+  useMutation(
+    options?: Omit<UseMutationOptions<Output<O["output"]>, ModuleRpcError, Input<O["input"]>>, "mutationFn">,
+  ): UseMutationResult<Output<O["output"]>, ModuleRpcError, Input<O["input"]>>;
+  call(input: Input<O["input"]>): Promise<Output<O["output"]>>;
+};
+
+export interface ContractHooks<C extends AnyContract> {
+  readonly queries: { readonly [K in keyof C["queries"]]: C["queries"][K] extends OperationDef ? QueryHooks<C["queries"][K]> : never };
+  readonly commands: { readonly [K in keyof C["commands"]]: C["commands"][K] extends OperationDef ? CommandHooks<C["commands"][K]> : never };
+  /** Invalidates every cached query of this contract, e.g. after a command that changes a lot. */
+  invalidateAll(): Promise<void>;
+}
+
+export class ModuleRpcError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function buildContractHooks(contract: AnyContract, host: WebHost, queryClient: QueryClient): ContractHooks<AnyContract> {
+  const call = (op: OperationRef) => async (input: unknown) => {
+    const where = `${op.contractId}.${op.name}`;
+    const raw = await host.rpc(op.contractId, op.name, await validate(op.input, input ?? {}, `${where} input`));
+    return validate(op.output, raw, `${where} output`);
+  };
+  const key = (op: OperationRef) => (input?: unknown) => (input === undefined ? [op.contractId, op.name] : [op.contractId, op.name, input]);
+
+  const queries = Object.fromEntries(
+    Object.entries(contract.queries as Record<string, OperationRef>).map(([name, op]) => {
+      const fetch = call(op);
+      const keyOf = key(op);
+      return [
+        name,
+        {
+          // biome-ignore lint: forwarded straight to react-query
+          useQuery: (input: unknown, options?: any) => useQuery({ ...options, queryKey: keyOf(input ?? {}), queryFn: () => fetch(input) }),
+          fetch,
+          key: keyOf,
+          invalidate: (input?: unknown) => queryClient.invalidateQueries({ queryKey: keyOf(input) }),
+        },
+      ];
+    }),
+  );
+  const commands = Object.fromEntries(
+    Object.entries(contract.commands as Record<string, OperationRef>).map(([name, op]) => {
+      const run = call(op);
+      // biome-ignore lint: forwarded straight to react-query
+      return [name, { useMutation: (options?: any) => useMutation({ ...options, mutationFn: run }), call: run }];
+    }),
+  );
+  return {
+    queries,
+    commands,
+    invalidateAll: () => queryClient.invalidateQueries({ queryKey: [contract.id] }),
+  } as unknown as ContractHooks<AnyContract>;
+}
+
+function useContractHooks<C extends AnyContract>(contract: C): ContractHooks<C> {
+  const { host } = useHostContext();
+  const queryClient = useQueryClient();
+  return useMemo(() => buildContractHooks(contract, host, queryClient), [contract, host, queryClient]) as unknown as ContractHooks<C>;
+}
+
+// --- host ---------------------------------------------------------------------------
+
+export interface WebHostOptions {
+  /** The app's top-level web modules; their requirements are pulled in. */
+  modules: readonly AnyWebModule[];
+  /** Where the server host is mounted, e.g. `https://api.example.com/m`. */
+  baseUrl: string;
+  history?: RouterHistory;
+  /** Where `/` goes when no page claims it. */
+  home?: PageRef;
+  fetch?: typeof fetch;
+}
+
+interface ResolvedNavItem {
+  readonly module: string;
+  readonly label: string;
+  readonly href: string;
+  readonly page: PageRef;
+  readonly icon?: ComponentType<{ className?: string }>;
+  readonly useBadge?: () => number | undefined;
+  readonly activeOn: readonly PageRef[];
+  readonly order: number;
+}
+
+export interface WebHost {
+  readonly modules: readonly AnyWebModule[];
+  readonly history: RouterHistory;
+  readonly routes: readonly CompiledRoute[];
+  readonly nav: readonly ResolvedNavItem[];
+  readonly home: PageRef | undefined;
+  componentFor(page: PageRef): ComponentType<{ params: unknown }> | undefined;
+  contributionsFor(slot: SlotRef): readonly Contribution[];
+  href<P extends PageRef>(page: P, params?: Output<P["params"]>): string;
+  rpc(contractId: string, op: string, input: unknown): Promise<unknown>;
+}
+
+export function createWebHost(options: WebHostOptions): WebHost {
+  const modules = resolveModules(options.modules, "web", { requireProviders: false });
+  const history = options.history ?? browserHistory();
+  const doFetch = options.fetch ?? globalThis.fetch.bind(globalThis);
+
+  const pageComponents = new Map<string, ComponentType<{ params: unknown }>>();
+  const compiled: CompiledRoute[] = [];
+  const contributions = new Map<string, Contribution[]>();
+  const nav: ResolvedNavItem[] = [];
+  const pageKey = (page: { contractId: string; name: string }) => `${page.contractId}.${page.name}`;
+  const knownPages = new Map<string, PageRef>();
+
+  for (const module of modules) {
+    const contract = module.contract as AnyContract | undefined;
+    const pages = (module.parts.pages ?? {}) as Record<string, ComponentType<{ params: unknown }>>;
+    for (const [name, page] of Object.entries((contract?.pages ?? {}) as Record<string, PageRef>)) {
+      const component = pages[name];
+      if (!component) throw new ModuleCompositionError(`web "${module.id}" has no component for page "${name}"`);
+      pageComponents.set(pageKey(page), component);
+      knownPages.set(pageKey(page), page);
+      const route = compileRoute(page);
+      const clash = compiled.find((r) => r.pattern.source === route.pattern.source);
+      if (clash) {
+        throw new ModuleCompositionError(`pages "${pageKey(clash.page)}" and "${pageKey(page)}" share the path ${page.path}`);
+      }
+      compiled.push(route);
+    }
+    for (const name of Object.keys(pages)) {
+      if (!contract || !(name in contract.pages)) throw new ModuleCompositionError(`web "${module.id}" has a component for unknown page "${name}"`);
+    }
+  }
+
+  for (const module of modules) {
+    const visible = visibleContracts(module);
+    const assertVisible = (contractId: string, what: string) => {
+      if (!visible.has(contractId)) throw new ModuleCompositionError(`web "${module.id}" ${what} of "${contractId}" without requiring it`);
+    };
+    for (const c of module.parts.contributions ?? []) {
+      assertVisible(c.slot.contractId, `contributes to a slot`);
+      const key = pageKey(c.slot);
+      contributions.set(key, [...(contributions.get(key) ?? []), c].sort((a, b) => a.order - b.order));
+    }
+    for (const item of module.parts.nav ?? []) {
+      assertVisible(item.to.contractId, `links nav to a page`);
+      if (!knownPages.has(pageKey(item.to))) {
+        throw new ModuleCompositionError(`web "${module.id}" links nav to "${pageKey(item.to)}", which no installed module renders`);
+      }
+      nav.push({
+        module: module.id,
+        label: item.label,
+        page: item.to,
+        href: buildHref(item.to, item.params as Record<string, unknown> | undefined),
+        icon: item.icon,
+        useBadge: item.useBadge,
+        activeOn: item.activeOn ?? [],
+        order: item.order ?? 100,
+      });
+    }
+  }
+  nav.sort((a, b) => a.order - b.order);
+
+  if (options.home && !knownPages.has(pageKey(options.home))) {
+    throw new ModuleCompositionError(`home page "${pageKey(options.home)}" isn't rendered by any installed module`);
+  }
+
+  return {
+    modules,
+    history,
+    routes: sortRoutes(compiled),
+    nav,
+    home: options.home,
+    componentFor: (page) => pageComponents.get(pageKey(page)),
+    contributionsFor: (slot) => contributions.get(pageKey(slot)) ?? [],
+    href: (page, params) => buildHref(page, params as Record<string, unknown> | undefined),
+    async rpc(contractId, op, input) {
+      const response = await doFetch(`${options.baseUrl}/${contractId}/rpc/${op}`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(input),
+      });
+      if (!response.ok) {
+        const body = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new ModuleRpcError(response.status, body.error ?? response.statusText);
+      }
+      return response.json();
+    },
+  };
+}
+
+// --- react bindings ---------------------------------------------------------------
+
+interface HostContextValue {
+  host: WebHost;
+  location: string;
+}
+
+const HostContext = createContext<HostContextValue | null>(null);
+
+function useHostContext(): HostContextValue {
+  const value = useContext(HostContext);
+  if (!value) throw new Error("module-host: wrap the app in <ModuleHostProvider>");
+  return value;
+}
+
+export function ModuleHostProvider({ host, children }: { host: WebHost; children: ReactNode }) {
+  const location = useSyncExternalStore(host.history.subscribe, host.history.location, host.history.location);
+  const value = useMemo(() => ({ host, location }), [host, location]);
+  return <HostContext.Provider value={value}>{children}</HostContext.Provider>;
+}
+
+export function useNavigate() {
+  const { host } = useHostContext();
+  return <P extends PageRef>(page: P, ...[params]: {} extends Output<P["params"]> ? [params?: Output<P["params"]>] : [params: Output<P["params"]>]) =>
+    host.history.push(host.href(page, params));
+}
+
+/**
+ * Client-side navigation to an already-built href (e.g. a nav entry's
+ * `href`). Returns a click handler that leaves modified clicks (new tab,
+ * etc.) to the browser.
+ */
+export function useNavigateHref() {
+  const { host } = useHostContext();
+  return (href: string) => (event?: MouseEvent<HTMLAnchorElement>) => {
+    if (event && (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)) return;
+    event?.preventDefault();
+    host.history.push(href);
+  };
+}
+
+/** The matched page and its parsed params, or undefined. */
+export function useRoute(): { page: PageRef; params: unknown } | undefined {
+  const { host, location } = useHostContext();
+  return useMemo(() => {
+    const match = matchRoute(host.routes, location);
+    if (!match) return undefined;
+    try {
+      return { page: match.route.page, params: validateSync(match.route.page.params, match.raw, "route params") };
+    } catch {
+      return undefined;
+    }
+  }, [host, location]);
+}
+
+export type LinkProps<P extends PageRef> = {
+  readonly to: P;
+  readonly children?: ReactNode;
+  readonly className?: string;
+  readonly title?: string;
+} & ParamsArg<P>;
+
+export function Link<P extends PageRef>(props: LinkProps<P>) {
+  const { host } = useHostContext();
+  const href = host.href(props.to, (props as { params?: Output<P["params"]> }).params);
+  const onClick = (event: MouseEvent<HTMLAnchorElement>) => {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    host.history.push(href);
+  };
+  return (
+    <a href={href} onClick={onClick} className={props.className} title={props.title}>
+      {props.children}
+    </a>
+  );
+}
+
+/** Renders the page for the current location. `/` falls back to `home`; anything else unmatched renders `notFound`. */
+export function RouterOutlet({ notFound = null }: { notFound?: ReactNode }) {
+  const { host, location } = useHostContext();
+  const route = useRoute();
+  if (!route) {
+    const pathname = location.split("?")[0];
+    if ((pathname === "/" || pathname === "") && host.home) {
+      queueMicrotask(() => host.history.replace(host.href(host.home!, {} as never)));
+      return null;
+    }
+    return <>{notFound}</>;
+  }
+  const PageComponent = host.componentFor(route.page)!;
+  return (
+    <ContributionBoundary label={`page ${route.page.contractId}.${route.page.name}`} key={location}>
+      <PageComponent params={route.params} />
+    </ContributionBoundary>
+  );
+}
+
+export interface NavEntry extends ResolvedNavItem {
+  readonly active: boolean;
+}
+
+export function useNav(): readonly NavEntry[] {
+  const { host } = useHostContext();
+  const route = useRoute();
+  const isRoute = (page: PageRef) => route !== undefined && route.page.contractId === page.contractId && route.page.name === page.name;
+  return host.nav.map((item) => ({ ...item, active: isRoute(item.page) || item.activeOn.some(isRoute) }));
+}
+
+const noBadge = () => undefined;
+
+/** Runs a nav item's badge hook. Call it from the component that renders that one item. */
+export function useNavBadge(item: Pick<ResolvedNavItem, "useBadge">): number | undefined {
+  return (item.useBadge ?? noBadge)();
+}
+
+/** Every contribution to a slot, ordered - for pages that lay them out themselves (tabs, a grid). */
+export function useSlot<Props>(slot: SlotRef<string, string, Props>): readonly Contribution<Props>[] {
+  const { host } = useHostContext();
+  return host.contributionsFor(slot as SlotRef) as readonly Contribution<Props>[];
+}
+
+/**
+ * Renders every module's contribution to `slot`, in order, each inside its
+ * own error boundary so one broken contribution can't take the page down.
+ */
+export function Slot<Props>({ slot, props, wrap }: { slot: SlotRef<string, string, Props>; props: Props; wrap?: (node: ReactNode, index: number) => ReactNode }) {
+  const contributions = useSlot(slot);
+  return (
+    <>
+      {contributions.map((c, i) => {
+        const Contributed = c.component as ComponentType<Props & object>;
+        const node = (
+          <ContributionBoundary key={i} label={`${slot.contractId}.${slot.name} contribution`}>
+            <Contributed {...(props as Props & object)} />
+          </ContributionBoundary>
+        );
+        return wrap ? <div key={i}>{wrap(node, i)}</div> : node;
+      })}
+    </>
+  );
+}
+
+class ContributionBoundary extends Component<{ label: string; children: ReactNode }, { failed: boolean }> {
+  override state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  override componentDidCatch(error: unknown) {
+    console.error(`module-host: ${this.props.label} crashed`, error);
+  }
+
+  override render() {
+    return this.state.failed ? null : this.props.children;
+  }
+}
+
+/**
+ * Shows and links any entity by id - a person from journal's UI, say -
+ * via the owning contract's `labels` query and `:id` page, without
+ * importing anything from the owner beyond its contract.
+ */
+export function EntityLink({ entity, id, className, fallback = "Unknown" }: { entity: EntityRef; id: number; className?: string; fallback?: string }) {
+  const { host } = useHostContext();
+  const label = useQuery({
+    queryKey: [entity.contractId, entity.labels.name, { ids: [id] }],
+    queryFn: async () => {
+      const raw = await host.rpc(entity.contractId, entity.labels.name, { ids: [id] });
+      const rows = (await validate(entity.labels.output, raw, `${entity.contractId}.${entity.labels.name} output`)) as {
+        id: number;
+        label: string | null;
+      }[];
+      return rows.find((r) => r.id === id)?.label ?? null;
+    },
+  });
+  return (
+    <Link to={entity.page as PageRef} params={{ id } as never} className={className}>
+      {label.data ?? fallback}
+    </Link>
+  );
+}
+
+export { isContract, operationsOf };
