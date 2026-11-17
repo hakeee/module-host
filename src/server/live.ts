@@ -3,12 +3,10 @@ import type { VaultHandle } from "@hakeee/vault-service";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 /** What the browser receives on `/<prefix>/_live`. */
-export interface LiveMessage {
-  readonly type: "event";
-  readonly contract: string;
-  readonly event: string;
-  readonly payload: unknown;
-}
+export type LiveMessage =
+  | { readonly type: "event"; readonly contract: string; readonly event: string; readonly payload: unknown }
+  /** A module's job list changed for this user - refetch `useJobs`. No job details travel. */
+  | { readonly type: "jobs"; readonly module: string };
 
 /** Close code sent when a socket's vault session is gone; the client should wait for an unlock, not hammer reconnects. */
 export const LIVE_CLOSE_VAULT_LOCKED = 4423;

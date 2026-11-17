@@ -53,6 +53,10 @@ export function createLiveClient(config: {
     } catch {
       return;
     }
+    if (message.type === "jobs" && typeof (message as { module?: unknown }).module === "string") {
+      current?.invalidate((message as { module: string }).module, "_jobs");
+      return;
+    }
     if (message.type !== "event" || !message.contract || !message.event) return;
     const contract = config.contracts.get(message.contract);
     const ref = (contract?.events as Record<string, EventRef> | undefined)?.[message.event];

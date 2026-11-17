@@ -12,14 +12,18 @@ import {
   type OperationRef,
 } from "../contract.js";
 import { ModuleCompositionError, resolveModules, visibleContracts } from "../resolve.js";
+import type { Caller, Client } from "../client.js";
 import { ContractInputError, ContractValidationError, validate, type Input, type Output, type Schema } from "../standardSchema.js";
-import { createJobStore, retryDelayMs, type JobRow, type JobStore, type RawSqlite } from "./jobs.js";
-import { createLiveHub, type LiveHub } from "./live.js";
+import { createRemoteInvoker, registerInternalRoutes, relayLive, type RemoteDef } from "./internal.js";
+import { JOBS_TABLE, createJobStore, retryDelayMs, type JobRow, type JobStore, type RawSqlite } from "./jobs.js";
+import { createLiveHub, type LiveHub, type LiveMessage } from "./live.js";
 import { checkTables } from "./tables.js";
 
 export { checkTables, tablesOf } from "./tables.js";
+export type { Caller, Client } from "../client.js";
 export { JOBS_TABLE, retryDelayMs } from "./jobs.js";
 export { LIVE_CLOSE_VAULT_LOCKED, type LiveMessage } from "./live.js";
+export { ModuleRemoteError, type RemoteDef } from "./internal.js";
 
 // --- the app's database type ------------------------------------------------
 
@@ -45,11 +49,6 @@ export type ModuleDb = Register extends { db: infer D } ? D : BetterSQLite3Datab
 
 // --- call contexts -------------------------------------------------------
 
-/** Who a call is on behalf of. Enough to re-derive any module's own vault scope. */
-export interface Caller {
-  readonly userId: number;
-  readonly sessionId: string;
-}
 
 /** What a module's handler gets: the caller, plus *its own* vault scope (named after the module id). */
 export interface CallContext extends Caller {
@@ -90,17 +89,6 @@ type SectionImpl<Name extends string, Ops, L extends boolean> = keyof Ops extend
 export type Implementation<C extends AnyContract, L extends boolean> = SectionImpl<"queries", C["queries"], L> &
   SectionImpl<"commands", C["commands"], L>;
 
-type ClientOps<Ops> = {
-  readonly [K in keyof Ops]: Ops[K] extends OperationDef
-    ? (caller: Caller, input: Input<Ops[K]["input"]>) => Promise<Output<Ops[K]["output"]>>
-    : never;
-};
-
-/** A typed, validated, in-process client for one contract. */
-export interface Client<C extends AnyContract> {
-  readonly queries: ClientOps<C["queries"]>;
-  readonly commands: ClientOps<C["commands"]>;
-}
 
 type EventPayload<C extends AnyContract, E extends keyof C["events"]> = C["events"][E] extends { payload: infer S }
   ? S extends Schema
@@ -185,6 +173,12 @@ export interface ServerModuleDef<
   readonly implement?: C extends AnyContract ? Implementation<C, L> | ((ctx: ServerContext<C, R, L, J>) => Implementation<C, L>) : never;
   /** Background job types (name -> payload schema); handlers are registered in `setup` with `ctx.jobs.handle`. */
   readonly jobs?: J;
+  /**
+   * Periodic jobs, per user: every `everyMs`, each user with an unlocked
+   * session (host option `activeCallers`) gets `job` enqueued once, as
+   * them. A user who isn't around catches up on their next unlock.
+   */
+  readonly schedules?: Readonly<Record<string, { readonly job: keyof J & string; readonly everyMs: number; readonly payload?: unknown }>>;
   readonly setup?: (ctx: ServerContext<C, R, L, J>) => void;
 }
 
@@ -257,6 +251,14 @@ export interface ServerHostOptions {
   prepareVault?: (sessionId: string) => Promise<void>;
   /** Observability for the job runner - e.g. log jobs waiting on a locked vault. */
   onJob?: (event: JobEvent) => void;
+  /** Who's around right now - drives `schedules`. E.g. vault-service's `sessionCache.unlockedSessions()`. */
+  activeCallers?: () => readonly Caller[];
+  /** Serve this host's operations to other processes at `internalRoutes` (mounted by you, private network only). */
+  internal?: { secret: string };
+  /** Contracts implemented by other processes; `ctx.use` calls to them go over the internal channel. */
+  remotes?: readonly RemoteDef[];
+  /** Forward live messages to the host that holds the browsers' sockets (a worker -> the API). */
+  liveRelay?: { url: string; secret: string };
 }
 
 export interface JobEvent {
@@ -299,11 +301,33 @@ export interface ServerHost {
   readonly jobs: JobRunner;
   /** Open live-update sockets (for tests and diagnostics). */
   liveConnectionCount(): number;
+  /** The internal channel (needs `internal.secret`): mount at a private prefix, outside your cookie-auth routes. */
+  internalRoutes(app: FastifyInstance): Promise<void>;
+}
+
+export interface JobSummary {
+  id: number;
+  name: string;
+  status: "queued" | "running" | "done" | "failed";
+  attempts: number;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export function migrationsTableFor(moduleId: string): string {
   return `__module_${moduleId.replaceAll("-", "_")}_migrations`;
 }
+
+const SCHEDULES_TABLE = "__module_schedules";
+const SCHEDULES_DDL = `
+CREATE TABLE IF NOT EXISTS ${SCHEDULES_TABLE} (
+  module TEXT NOT NULL,
+  name TEXT NOT NULL,
+  user_id INTEGER NOT NULL,
+  last_run_at INTEGER NOT NULL,
+  PRIMARY KEY (module, name, user_id)
+);`;
 
 function rawSqlite(db: ModuleDb): RawSqlite {
   const client = (db as unknown as { $client?: RawSqlite }).$client;
@@ -313,6 +337,7 @@ function rawSqlite(db: ModuleDb): RawSqlite {
 
 function migrateResolved(db: ModuleDb, modules: readonly AnyServerModule[]): void {
   if (modules.some((m) => Object.keys(m.def.jobs ?? {}).length > 0)) createJobStore(rawSqlite(db)).ensureTable();
+  if (modules.some((m) => Object.keys(m.def.schedules ?? {}).length > 0)) rawSqlite(db).exec(SCHEDULES_DDL);
   for (const module of modules) {
     if (!module.def.migrationsFolder) continue;
     // The app's drizzle copy, not necessarily ours - same runtime shape.
@@ -331,7 +356,8 @@ export function migrateModules(db: ModuleDb, modules: readonly AnyServerModule[]
 }
 
 export function createServerHost(options: ServerHostOptions): ServerHost {
-  const modules = resolveModules(options.modules, "server");
+  const remoteContracts = (options.remotes ?? []).flatMap((r) => r.contracts);
+  const modules = resolveModules(options.modules, "server", { requireProviders: true, externalContracts: remoteContracts });
   const sharedTables = options.sharedTables ?? [];
   const logError = options.logError ?? ((error, message) => console.error(message, error));
 
@@ -350,6 +376,26 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
   const jobModules = modules.filter((m) => Object.keys(m.def.jobs ?? {}).length > 0).map((m) => m.id);
   let jobStore: JobStore | undefined;
   const jobs = () => (jobStore ??= createJobStore(rawSqlite(options.db)));
+
+  const publishLive = (userId: number, message: LiveMessage) => {
+    live?.publish(userId, message);
+    if (options.liveRelay) {
+      relayLive(options.liveRelay, userId, message).catch((error) => logError(error, "module-host: live relay failed"));
+    }
+  };
+
+  const remoteInvokers = new Map<string, ReturnType<typeof createRemoteInvoker>>();
+  for (const remote of options.remotes ?? []) {
+    const invoker = createRemoteInvoker(remote, () => {
+      throw new ModuleVaultLockedError();
+    });
+    for (const contract of remote.contracts) {
+      if (modules.some((m) => m.contract?.id === contract.id)) {
+        throw new ModuleCompositionError(`contract "${contract.id}" is both installed here and listed as remote`);
+      }
+      remoteInvokers.set(contract.id, invoker);
+    }
+  }
 
   const buildCall = (runtime: Runtime, caller: Caller, vault: VaultHandle): CallContext => {
     const base: CallContext = { userId: caller.userId, sessionId: caller.sessionId, vault: vault.scope(runtime.module.id) };
@@ -378,6 +424,21 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
   };
 
   const clientFor = (contract: AnyContract): Client<AnyContract> => {
+    const remote = remoteInvokers.get(contract.id);
+    if (remote) {
+      const section = (ops: Record<string, OperationRef>) =>
+        Object.fromEntries(
+          Object.entries(ops).map(([name, op]) => [
+            name,
+            async (caller: Caller, input: unknown) => {
+              const where = `${contract.id}.${name}`;
+              const valid = await validate(op.input, input, `${where} input`);
+              return validate(op.output, await remote(contract, op, caller, valid), `${where} output`);
+            },
+          ]),
+        );
+      return { queries: section(contract.queries), commands: section(contract.commands) } as unknown as Client<AnyContract>;
+    }
     const provider = providerOf.get(contract.id);
     if (!provider) throw new ModuleCompositionError(`no module implements contract "${contract.id}"`);
     const section = (ops: Record<string, OperationRef>) =>
@@ -401,10 +462,29 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
         logError(error, `"${runtime.module.id}" failed handling ${contract.id}.${event}`);
       }
     }
-    if ((ref as { live?: boolean }).live && live) {
-      live.publish(caller.userId, { type: "event", contract: contract.id, event, payload });
+    if ((ref as { live?: boolean }).live) {
+      publishLive(caller.userId, { type: "event", contract: contract.id, event, payload });
     }
   };
+
+  async function enqueueFor(runtime: Runtime, caller: Caller, name: string, payload: unknown, enqueueOptions: EnqueueOptions, at = Date.now()) {
+    const { module } = runtime;
+    const schema = (module.def.jobs ?? {})[name];
+    if (!schema) throw new Error(`"${module.id}" has no job "${name}"`);
+    const valid = await validate(schema, payload, `${module.id} job ${name}`);
+    const call = callFor(runtime, caller);
+    const jobId = jobs().insert({
+      module: module.id,
+      name,
+      userId: caller.userId,
+      sessionId: caller.sessionId,
+      payload: call.vault.encryptString(`job:${name}`, JSON.stringify(valid)),
+      maxAttempts: enqueueOptions.maxAttempts ?? 3,
+      runAt: at + (enqueueOptions.delayMs ?? 0),
+    });
+    publishLive(caller.userId, { type: "jobs", module: module.id });
+    return jobId;
+  }
 
   for (const module of modules) {
     const runtime: Runtime = { module, visible: visibleContracts(module), routePlugins: [], handlers: {}, jobHandlers: {} };
@@ -452,20 +532,8 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
           if (runtime.jobHandlers[name]) throw new ModuleCompositionError(`"${module.id}" handles job "${name}" twice`);
           runtime.jobHandlers[name] = handler as Runtime["jobHandlers"][string];
         },
-        async enqueue(caller, name, payload, enqueueOptions = {}) {
-          const schema = (module.def.jobs ?? {})[name];
-          if (!schema) throw new Error(`"${module.id}" has no job "${name}"`);
-          const valid = await validate(schema, payload, `${module.id} job ${name}`);
-          const call = callFor(runtime, caller);
-          return jobs().insert({
-            module: module.id,
-            name,
-            userId: caller.userId,
-            sessionId: caller.sessionId,
-            payload: call.vault.encryptString(`job:${name}`, JSON.stringify(valid)),
-            maxAttempts: enqueueOptions.maxAttempts ?? 3,
-            runAt: Date.now() + (enqueueOptions.delayMs ?? 0),
-          });
+        enqueue(caller, name, payload, enqueueOptions = {}) {
+          return enqueueFor(runtime, caller, name, payload, enqueueOptions);
         },
       },
     };
@@ -515,16 +583,56 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
       await handler(call, payload);
       jobs().done(row.id);
       options.onJob?.({ ...event, type: "done" });
+      publishLive(row.user_id, { type: "jobs", module: row.module });
     } catch (error) {
       const code = error instanceof Error ? error.constructor.name : "UnknownError";
       const outcome = jobs().fail(row, code, now + retryDelayMs(row.attempts));
       options.onJob?.({ ...event, type: outcome, error: code });
+      publishLive(row.user_id, { type: "jobs", module: row.module });
       if (outcome === "failed") logError(error, `job ${row.module}.${row.name} #${row.id} failed for good`);
+    }
+  };
+
+  const scheduled = modules.flatMap((m) =>
+    Object.entries(m.def.schedules ?? {}).map(([name, schedule]) => {
+      if (!(schedule.job in (m.def.jobs ?? {}))) {
+        throw new ModuleCompositionError(`"${m.id}" schedule "${name}" points at unknown job "${schedule.job}"`);
+      }
+      return { runtime: runtimes.get(m.id)!, name, ...schedule };
+    }),
+  );
+
+  /** Enqueues every due schedule once per active user (their latest session). */
+  const runSchedules = async (now: number) => {
+    if (scheduled.length === 0 || !options.activeCallers) return;
+    const sqlite = rawSqlite(options.db);
+    const byUser = new Map<number, Caller>();
+    for (const caller of options.activeCallers()) byUser.set(caller.userId, caller);
+    for (const caller of byUser.values()) {
+      for (const s of scheduled) {
+        const row = sqlite
+          .prepare(`SELECT last_run_at FROM ${SCHEDULES_TABLE} WHERE module = ? AND name = ? AND user_id = ?`)
+          .get(s.runtime.module.id, s.name, caller.userId) as { last_run_at: number } | undefined;
+        if (row && row.last_run_at + s.everyMs > now) continue;
+        try {
+          await enqueueFor(s.runtime, caller, s.job, s.payload ?? {}, {}, now);
+        } catch (error) {
+          if (error instanceof ModuleVaultLockedError) continue; // gone since listed - next tick
+          throw error;
+        }
+        sqlite
+          .prepare(
+            `INSERT INTO ${SCHEDULES_TABLE} (module, name, user_id, last_run_at) VALUES (?, ?, ?, ?)
+             ON CONFLICT (module, name, user_id) DO UPDATE SET last_run_at = excluded.last_run_at`,
+          )
+          .run(s.runtime.module.id, s.name, caller.userId, now);
+      }
     }
   };
 
   const jobRunner: JobRunner = {
     async runDue({ now, limit = Number.POSITIVE_INFINITY } = {}) {
+      await runSchedules(now ?? Date.now());
       if (jobModules.length === 0) return 0;
       let ran = 0;
       while (ran < limit) {
@@ -539,6 +647,7 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
     start({ pollMs = 1000 } = {}) {
       if (jobModules.length === 0) return () => {};
       jobs().ensureTable();
+      if (scheduled.length > 0) rawSqlite(options.db).exec(SCHEDULES_DDL);
       jobs().recoverRunning(jobModules);
       let stopped = false;
       let timer: NodeJS.Timeout | undefined;
@@ -579,7 +688,7 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
               const ops = operationsOf(module.contract);
               scope.post<{ Params: { op: string } }>("/rpc/:op", async (request, reply) => {
                 const op = ops[request.params.op];
-                if (!op) return reply.code(404).send({ error: "unknown operation" });
+                if (!op || op.serverOnly) return reply.code(404).send({ error: "unknown operation" });
                 const unlocked = options.requireVault(request, reply);
                 if (!unlocked) return reply;
                 try {
@@ -595,6 +704,37 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
                 }
               });
             }
+            if (Object.keys(module.def.jobs ?? {}).length > 0) {
+              // The caller's own jobs for this module - status only, never payloads.
+              scope.get("/_jobs", async (request, reply) => {
+                const unlocked = options.requireVault(request, reply);
+                if (!unlocked) return reply;
+                const rows = rawSqlite(options.db)
+                  .prepare(
+                    `SELECT id, name, status, attempts, error, created_at, updated_at FROM ${JOBS_TABLE}
+                     WHERE module = ? AND user_id = ? ORDER BY id DESC LIMIT 50`,
+                  )
+                  .all(module.id, unlocked.userId) as {
+                  id: number;
+                  name: string;
+                  status: JobSummary["status"];
+                  attempts: number;
+                  error: string | null;
+                  created_at: number;
+                  updated_at: number;
+                }[];
+                const jobsList: JobSummary[] = rows.map((r) => ({
+                  id: r.id,
+                  name: r.name,
+                  status: r.status,
+                  attempts: r.attempts,
+                  error: r.error,
+                  createdAt: new Date(r.created_at).toISOString(),
+                  updatedAt: new Date(r.updated_at).toISOString(),
+                }));
+                return { jobs: jobsList };
+              });
+            }
             for (const plugin of runtime.routePlugins) await plugin(scope);
           },
           { prefix: `/${module.id}` },
@@ -603,6 +743,31 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
     },
     client(contract) {
       return clientFor(contract) as never;
+    },
+    async internalRoutes(app) {
+      const internal = options.internal;
+      if (!internal) throw new Error("module-host: internalRoutes needs the `internal: { secret }` option");
+      app.setErrorHandler((error, _request, reply) => {
+        if (error instanceof ContractInputError) return reply.code(400).send({ error: error.message });
+        if (error instanceof OperationError) return reply.code(error.status).send({ error: error.message });
+        if (error instanceof ModuleVaultLockedError) return reply.code(423).send({ error: "vault locked" });
+        logError(error, "module-host: internal call failed");
+        return reply.code(500).send({ error: "internal error" });
+      });
+      registerInternalRoutes(app, {
+        secret: internal.secret,
+        async invoke(contractId, opName, version, caller, input) {
+          const provider = providerOf.get(contractId);
+          const op = provider?.module.contract ? operationsOf(provider.module.contract)[opName] : undefined;
+          if (!provider || !op) throw new OperationError(404, `no operation ${contractId}.${opName} here`);
+          if (version !== provider.module.contract!.version) {
+            throw new OperationError(409, `caller built against "${contractId}" v${version}, this host implements v${provider.module.contract!.version}`);
+          }
+          await options.prepareVault?.(caller.sessionId);
+          return invoke(provider, op, callFor(provider, caller), input);
+        },
+        publish: (userId, message) => live?.publish(userId, message),
+      });
     },
   };
 }

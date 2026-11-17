@@ -25,7 +25,7 @@ export class ModuleCompositionError extends Error {}
 export function resolveModules<M extends ComposableModule>(
   roots: readonly M[],
   side: string,
-  options: { requireProviders: boolean } = { requireProviders: true },
+  options: { requireProviders: boolean; externalContracts?: readonly AnyContract[] } = { requireProviders: true },
 ): M[] {
   const ordered: M[] = [];
   const state = new Map<M, "visiting" | "done">();
@@ -70,6 +70,15 @@ export function resolveModules<M extends ComposableModule>(
       if (!contract) continue;
       const provider = providers.get(contract.id);
       if (!provider) {
+        const external = options.externalContracts?.find((c) => c.id === contract.id);
+        if (external) {
+          if (external.version !== contract.version) {
+            throw new ModuleCompositionError(
+              `${side}: "${module.id}" was built against "${contract.id}" v${contract.version}, but the remote declares v${external.version}`,
+            );
+          }
+          continue;
+        }
         if (!options.requireProviders) continue;
         throw new ModuleCompositionError(
           `${side}: "${module.id}" requires contract "${contract.id}", but no module implements it`,

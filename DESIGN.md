@@ -56,6 +56,9 @@ export const peopleContract = defineContract({
 - **JSON-safe only.** The same operation is called over HTTP from the
   browser and in-process on the server; both must see identical values.
   Use strings for dates.
+- **`serverOnly: true`** on an operation: other modules can call it
+  (in-process or across processes), but it isn't served to browsers. Use
+  it for things like AI generation.
 - **Both directions are validated.** Input is checked at every boundary (a
   400 over HTTP). Output is checked too, and parsing strips fields the
   contract doesn't declare, so a handler can't leak extra data.
@@ -182,6 +185,12 @@ export default mod.define({
   `useSlot(slot)` gives the raw list for custom layouts.
 - **Nav** comes from the modules (`useNav()`, `useNavBadge(item)`). The
   app shell decides how to draw it.
+- **`<EntityLink>` batches:** label lookups made in the same tick go out as
+  one request per entity type, so a timeline of 50 person links is one
+  call.
+- **`useContractVersionCheck()`** compares the contracts this bundle was
+  built against with the server's `/_manifest`. A mismatch usually means a
+  stale tab after a deploy, so prompt a reload.
 
 ### Shared components
 
@@ -264,34 +273,64 @@ defineServerModule({
   - `onJob` reports every outcome.
   - On start, jobs a crash left `running` are requeued.
 - **Every declared job needs a handler**, checked at boot.
+- **Schedules:** `schedules: { nightly: { job: "sweep", everyMs: 86_400_000,
+  payload } }`. Each user with an unlocked session (host option
+  `activeCallers`, e.g. vault-service's `sessionCache.unlockedSessions()`)
+  gets the job enqueued once per period, as themselves. Someone who isn't
+  around catches up on their next unlock. Runs as part of the job runner's
+  tick.
+- **Visibility:** each module with jobs serves `GET /<module>/_jobs` (the
+  caller's own recent jobs: name, status, attempts, error class; never
+  payloads). The web side reads it with `mod.useJobs(contract)`. Every
+  enqueue and outcome pushes a `{ type: "jobs", module }` live message, so
+  that list refreshes by itself.
 
-### Running jobs in a separate process
+## Modules in other processes
 
-A host only claims jobs of *its own* modules, so a worker process can
-build a host with just the modules whose jobs it should run (e.g. one
-that needs network access the API doesn't have). The worker gets those
-modules' vault scopes from the API, never the DEK:
+Where a module runs is a composition choice. A host can install some
+modules and reach others in another process, e.g. an AI module that has
+to run where the GPU or Ollama is reachable. It all goes over one internal
+channel:
 
 ```ts
-// worker process
-const remote = createRemoteVault({ baseUrl: API_INTERNAL_URL + "/internal", secret, scopes: ["journal"] });
-const host = createServerHost({
-  modules: [journal], db, live: false,
-  vaultFor: remote.vaultFor, prepareVault: remote.prepare,   // keys fetched per session, cached briefly
-  requireVault: () => undefined,                             // no HTTP routes here
+// worker process: runs `ai` (and maybe some modules' jobs), serves it to the API
+const worker = createServerHost({
+  modules: [ai], db, live: false,
+  internal: { secret },                                    // serve worker.internalRoutes
+  liveRelay: { url: `${API}/internal/m`, secret },         // live events reach the browsers
+  vaultFor: remote.vaultFor, prepareVault: remote.prepare, // vault-service createRemoteVault
+  requireVault: () => undefined,
 });
-host.jobs.start();
+app.register(worker.internalRoutes, { prefix: "/internal/m" });
+
+// API: journal requires aiContract; calls go over the wire, transparently
+const api = createServerHost({
+  modules: [journal], db, internal: { secret },
+  remotes: [{ url: `${WORKER}/internal/m`, secret, contracts: [aiContract] }],
+  ...
+});
+app.register(api.internalRoutes, { prefix: "/internal/m" });   // receives relayed live events
 ```
 
-- `createRemoteVault` and the API's `/internal/scope-keys` route come from
-  vault-service. A per-scope secret (`scopeSecrets.journal`) limits a
-  worker to the scopes it runs. Only **named scopes** cross the process
-  boundary: `call.legacy` throws in a worker, so jobs over pre-scope data
-  stay in the API process (or the data moves to a named scope first).
-- **Run each module's jobs in one process only.** Crash recovery requeues
-  `running` jobs of the modules a runner hosts.
-- **Events emitted in a worker don't reach the API's live sockets** yet.
-  See ROADMAP.
+- **Remote providers count for composition.** A contract-only requirement
+  is satisfied by a `remotes` entry, with the same version check. At call
+  time the contract version travels in a header, and a mismatch is a 409
+  rather than a misread.
+- **Calls carry the caller.** The remote host builds the call context with
+  *its own* vault scope for that session (`prepareVault` +
+  `createRemoteVault`), so isolation holds across processes. Handler
+  errors come back as `OperationError` with the same status; a locked vault
+  comes back as `ModuleVaultLockedError`; validation runs on both ends.
+- **`internalRoutes` is secret-gated** (constant-time comparison) and is
+  meant for a private network. Mount it outside your cookie-auth routes.
+- **Jobs in another process:** a host only claims jobs of the modules it
+  installs, so a worker can run a subset. Only **named scopes** cross
+  processes; `call.legacy` throws in a worker, so jobs over pre-scope data
+  stay in the API process. Run each module's jobs in one process only,
+  because crash recovery requeues `running` jobs of the modules a runner
+  hosts.
+- **Not yet:** events from one process reaching *subscriber modules* in
+  another. Only the live push to browsers is relayed.
 
 ## Rules that aren't enforced by types (yet)
 

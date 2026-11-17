@@ -131,6 +131,12 @@ export interface WebModuleBuilder<C extends AnyContract | undefined, R extends r
    * about components created during render quiet.
    */
   readonly Component: <Props extends object>(props: { of: ComponentRef<VisibleId<C, R>, string, Props> } & Props) => ReactNode;
+  /**
+   * The current user's recent jobs of a visible module (status only - never
+   * payloads). Refetched live as jobs move along, when `<LiveConnection>`
+   * is mounted.
+   */
+  useJobs(contract: ContractOf<R[number]> | OwnContract<C>): UseQueryResult<{ jobs: JobSummary[] }, ModuleRpcError>;
   /** Runs `handler` for each live event of a visible contract (see `<LiveConnection>`). */
   useLiveEvent<U extends ContractOf<R[number]> | OwnContract<C>, E extends keyof U["events"] & string>(
     contract: U,
@@ -191,6 +197,14 @@ export function webModule<const C extends AnyContract | undefined = undefined, c
       const Exposed = host.exposedComponent(ref);
       return <Exposed {...rest} />;
     } as WebModuleBuilder<C, R>["Component"],
+    useJobs(target: AnyContract) {
+      if (!visible.has(target.id)) throw new ModuleCompositionError(`"${id}" reads jobs of "${target.id}" without requiring it`);
+      const { host } = useHostContext();
+      return useQuery({
+        queryKey: [target.id, "_jobs"],
+        queryFn: () => host.get(`/${target.id}/_jobs`) as Promise<{ jobs: JobSummary[] }>,
+      });
+    },
     useLiveEvent(target, event, handler) {
       if (!visible.has(target.id)) throw new ModuleCompositionError(`"${id}" listens to "${target.id}" without requiring it`);
       useLiveSubscription(target.id, event, handler as (payload: unknown) => void);
@@ -226,6 +240,17 @@ export interface ContractHooks<C extends AnyContract> {
   readonly commands: { readonly [K in keyof C["commands"]]: C["commands"][K] extends OperationDef ? CommandHooks<C["commands"][K]> : never };
   /** Invalidates every cached query of this contract, e.g. after a command that changes a lot. */
   invalidateAll(): Promise<void>;
+}
+
+/** A job as `useJobs` reports it. */
+export interface JobSummary {
+  id: number;
+  name: string;
+  status: "queued" | "running" | "done" | "failed";
+  attempts: number;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export class ModuleRpcError extends Error {
@@ -322,6 +347,12 @@ export interface WebHost {
   contributionsFor(slot: SlotRef): readonly Contribution[];
   href<P extends PageRef>(page: P, params?: Output<P["params"]>): string;
   rpc(contractId: string, op: string, input: unknown): Promise<unknown>;
+  /** GET a path under `baseUrl` (credentials included). */
+  get(path: string): Promise<unknown>;
+  /** One label for an entity id; lookups in the same tick are batched into one request per entity type. */
+  label(entity: EntityRef, id: number): Promise<string | null>;
+  /** Every contract this bundle knows (installed web modules' and their requirements'), by id. */
+  readonly contracts: ReadonlyMap<string, AnyContract>;
 }
 
 export function createWebHost(options: WebHostOptions): WebHost {
@@ -433,9 +464,43 @@ export function createWebHost(options: WebHostOptions): WebHost {
   }
   nav.sort((a, b) => a.order - b.order);
 
+  type LabelBatch = {
+    entity: EntityRef;
+    waiting: Map<number, { resolve: (label: string | null) => void; reject: (error: unknown) => void }[]>;
+  };
+  const labelBatches = new Map<string, LabelBatch>();
+  const flushLabels = async ({ entity, waiting }: LabelBatch) => {
+    const ids = [...waiting.keys()];
+    try {
+      const raw = await hostRpc(entity.contractId, entity.labels.name, { ids });
+      const rows = (await validate(entity.labels.output, raw, `${entity.contractId}.${entity.labels.name} output`)) as {
+        id: number;
+        label: string | null;
+      }[];
+      const byId = new Map(rows.map((r) => [r.id, r.label]));
+      for (const [id, list] of waiting) for (const w of list) w.resolve(byId.get(id) ?? null);
+    } catch (error) {
+      for (const list of waiting.values()) for (const w of list) w.reject(error);
+    }
+  };
+
   if (options.home && !knownPages.has(pageKey(options.home))) {
     throw new ModuleCompositionError(`home page "${pageKey(options.home)}" isn't rendered by any installed module`);
   }
+
+  const hostRpc = async (contractId: string, op: string, input: unknown) => {
+    const response = await doFetch(`${options.baseUrl}/${contractId}/rpc/${op}`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+    });
+    if (!response.ok) {
+      const body = (await response.json().catch(() => ({}))) as { error?: string };
+      throw new ModuleRpcError(response.status, body.error ?? response.statusText);
+    }
+    return response.json();
+  };
 
   return {
     modules,
@@ -448,19 +513,35 @@ export function createWebHost(options: WebHostOptions): WebHost {
     live,
     contributionsFor: (slot) => contributions.get(pageKey(slot)) ?? [],
     href: (page, params) => buildHref(page, params as Record<string, unknown> | undefined),
-    async rpc(contractId, op, input) {
-      const response = await doFetch(`${options.baseUrl}/${contractId}/rpc/${op}`, {
-        method: "POST",
-        credentials: "include",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(input),
-      });
+    contracts: knownContracts,
+    async get(path) {
+      const response = await doFetch(`${options.baseUrl}${path}`, { credentials: "include" });
       if (!response.ok) {
         const body = (await response.json().catch(() => ({}))) as { error?: string };
         throw new ModuleRpcError(response.status, body.error ?? response.statusText);
       }
       return response.json();
     },
+    label(entity, id) {
+      const key = `${entity.contractId}.${entity.labels.name}`;
+      let batch = labelBatches.get(key);
+      if (!batch) {
+        batch = { entity, waiting: new Map() };
+        labelBatches.set(key, batch);
+        const current = batch;
+        setTimeout(() => {
+          labelBatches.delete(key);
+          void flushLabels(current);
+        }, 0);
+      }
+      const waiting = batch.waiting;
+      return new Promise((resolve, reject) => {
+        const list = waiting.get(id) ?? [];
+        list.push({ resolve, reject });
+        waiting.set(id, list);
+      });
+    },
+    rpc: hostRpc,
   };
 }
 
@@ -661,6 +742,40 @@ function useLiveSubscription(contractId: string, event: string, handler: (payloa
   useEffect(() => host.live.subscribe(contractId, event, (payload) => latest.current(payload)), [host, contractId, event]);
 }
 
+export interface ContractVersionMismatch {
+  readonly id: string;
+  /** What this bundle was built against. */
+  readonly web: number;
+  /** What the server runs; `null` when it doesn't run that contract at all. */
+  readonly server: number | null;
+}
+
+/**
+ * Compares the contracts this bundle was built against with what the
+ * server runs (`GET /_manifest`). A mismatch usually means a stale tab
+ * after a deploy - prompt a reload. Contracts the server lists as
+ * implemented elsewhere (remotes) don't appear in its manifest, so only
+ * contracts it runs itself are compared.
+ */
+export function useContractVersionCheck(): { mismatches: readonly ContractVersionMismatch[]; checked: boolean } {
+  const { host } = useHostContext();
+  const manifest = useQuery({
+    queryKey: ["__module_host", "manifest"],
+    queryFn: () => host.get("/_manifest") as Promise<{ modules: { id: string; contract: { id: string; version: number } | null }[] }>,
+    staleTime: 60_000,
+  });
+  return useMemo(() => {
+    if (!manifest.data) return { mismatches: [], checked: false };
+    const server = new Map(manifest.data.modules.flatMap((m) => (m.contract ? [[m.contract.id, m.contract.version] as const] : [])));
+    const mismatches: ContractVersionMismatch[] = [];
+    for (const contract of host.contracts.values()) {
+      const version = server.get(contract.id);
+      if (version !== undefined && version !== contract.version) mismatches.push({ id: contract.id, web: contract.version, server: version });
+    }
+    return { mismatches, checked: true };
+  }, [manifest.data, host]);
+}
+
 /**
  * Shows and links any entity by id - a person from journal's UI, say -
  * via the owning contract's `labels` query and `:id` page, without
@@ -670,14 +785,7 @@ export function EntityLink({ entity, id, className, fallback = "Unknown" }: { en
   const { host } = useHostContext();
   const label = useQuery({
     queryKey: [entity.contractId, entity.labels.name, { ids: [id] }],
-    queryFn: async () => {
-      const raw = await host.rpc(entity.contractId, entity.labels.name, { ids: [id] });
-      const rows = (await validate(entity.labels.output, raw, `${entity.contractId}.${entity.labels.name} output`)) as {
-        id: number;
-        label: string | null;
-      }[];
-      return rows.find((r) => r.id === id)?.label ?? null;
-    },
+    queryFn: () => host.label(entity, id),
   });
   return (
     <Link to={entity.page as PageRef} params={{ id } as never} className={className}>

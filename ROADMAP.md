@@ -23,21 +23,25 @@ boundaries, entity links). First consumer: Ebba's people module.
   modules, and `prepareVault` supports remote vaults (vault-service
   `createRemoteVault`).
 
+## v0.3: across processes (done)
+
+- `serverOnly` operations.
+- Remote providers over a secret-gated internal channel. They count for
+  composition and version checks, carry the caller, map errors and locked
+  vaults, and validate on both ends.
+- Live relay: a worker's live events reach the API's sockets.
+- Scheduled jobs per active user (`activeCallers`); job visibility
+  (`/_jobs`, `useJobs`, pushed live).
+- `useContractVersionCheck()` against `/_manifest`; batched `<EntityLink>`
+  labels.
+- `Caller`/`Client` types moved to the root entry, so contract files can
+  export typed helpers without dragging server types into browser
+  type-checks.
+
 ## Next
 
-- **Live events from worker processes:** a worker that emits an event
-  should reach the API's sockets. Likely a small "publish" call to the API
-  over the internal channel, or a notification table the API polls.
-- **Scheduled jobs:** periodic work per unlocked session (e.g. Ebba's
-  nightly tag maintenance), declared by modules instead of hand-rolled
-  timers.
-- **Job visibility:** a contract-level way for a module's UI to show its
-  own job progress (queued/running/failed), like Ebba's current jobs list.
-- **Browser version check** against `GET /m/_manifest`: warn when the web
-  bundle was built against different contract versions than the server
-  runs (a stale tab after a deploy).
-- **Batching for `labels` lookups**, so a timeline of 50 `<EntityLink>`s
-  makes one request, not 50.
+- **Cross-process event subscriptions:** a module in the API subscribing
+  to events emitted in the worker, beyond the browser relay.
 - **Lint rule** for "don't import another module's internals", beyond
   what package `exports` already block.
 - **Publish** under `@hakeee/*`. This drops the linked-repo caveats in

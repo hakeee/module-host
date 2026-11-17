@@ -9,6 +9,12 @@ import type { Schema } from "./standardSchema.js";
 export interface OperationDef {
   readonly input: Schema;
   readonly output: Schema;
+  /**
+   * Callable by other modules (in-process or over the internal channel)
+   * but not served to browsers - e.g. AI generation, which shouldn't be
+   * something any logged-in tab can drive directly.
+   */
+  readonly serverOnly?: boolean;
 }
 
 /** A routable page. `params` parses the path's `:name` segments (strings) into typed values. */

@@ -219,3 +219,103 @@ describe("live updates", () => {
     expect(FakeSocket.instances[0]!.closed).toBe(true);
   });
 });
+
+// --- jobs, version check, label batching ---------------------------------------
+
+describe("jobs, version check and entity labels", () => {
+  const jobsContract = defineContract({
+    id: "reports",
+    version: 3,
+    queries: {
+      labels: {
+        input: z.object({ ids: z.array(z.number()) }),
+        output: z.array(z.object({ id: z.number(), label: z.string().nullable() })),
+      },
+    },
+    pages: { detail: { path: "/reports/:id", params: z.object({ id: z.coerce.number() }) } },
+    entities: { report: { page: "detail", labels: "labels" } },
+  });
+  const reportsWeb = webModule({ contract: jobsContract }).define({ pages: { detail: () => null } });
+  const shellMod = webModule({ contract: pagesContract, requires: [reportsWeb] });
+
+  function fakeFetch(manifestVersion: number) {
+    return vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.endsWith("/_manifest")) {
+        return new Response(JSON.stringify({ modules: [{ id: "reports", contract: { id: "reports", version: manifestVersion } }] }));
+      }
+      if (url.endsWith("/reports/_jobs")) {
+        return new Response(JSON.stringify({ jobs: [{ id: 1, name: "build", status: "running", attempts: 0, error: null, createdAt: "", updatedAt: "" }] }));
+      }
+      if (url.endsWith("/reports/rpc/labels")) {
+        const { ids } = JSON.parse(String(init?.body)) as { ids: number[] };
+        return new Response(JSON.stringify(ids.map((id) => ({ id, label: `Report ${id}` }))));
+      }
+      return new Response("{}", { status: 404 });
+    });
+  }
+
+  it("useJobs fetches the module's jobs and refetches on a 'jobs' live message", async () => {
+    let jobsView: unknown;
+    const Home = () => {
+      jobsView = shellMod.useJobs(jobsContract).data;
+      return null;
+    };
+    const fetch = fakeFetch(3);
+    const host = createWebHost({
+      modules: [shellMod.define({ pages: { home: Home } })],
+      baseUrl: "https://api.test/m",
+      history: memoryHistory("/"),
+      WebSocket: FakeSocket as never,
+      fetch: fetch as never,
+    });
+    const { queryClient } = mount(host);
+    await vi.waitFor(() => expect(jobsView).toMatchObject({ jobs: [{ name: "build", status: "running" }] }));
+
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    FakeSocket.instances[0]!.open();
+    FakeSocket.instances[0]!.receive({ type: "jobs", module: "reports" });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["reports", "_jobs"] });
+  });
+
+  it("reports contract version mismatches against the server manifest", async () => {
+    const { useContractVersionCheck } = await import("./index.js");
+    let result: unknown;
+    const Home = () => {
+      result = useContractVersionCheck();
+      return null;
+    };
+    const host = createWebHost({
+      modules: [shellMod.define({ pages: { home: Home } })],
+      baseUrl: "https://api.test/m",
+      history: memoryHistory("/"),
+      WebSocket: FakeSocket as never,
+      fetch: fakeFetch(4) as never,
+    });
+    mount(host);
+    await vi.waitFor(() => expect(result).toEqual({ checked: true, mismatches: [{ id: "reports", web: 3, server: 4 }] }));
+  });
+
+  it("batches entity labels from one render into a single request", async () => {
+    const { EntityLink } = await import("./index.js");
+    const Home = () => (
+      <p>
+        {[1, 2, 3, 2].map((id, i) => (
+          <EntityLink key={i} entity={jobsContract.entities.report} id={id} />
+        ))}
+      </p>
+    );
+    const fetch = fakeFetch(3);
+    const host = createWebHost({
+      modules: [shellMod.define({ pages: { home: Home } })],
+      baseUrl: "https://api.test/m",
+      history: memoryHistory("/"),
+      WebSocket: FakeSocket as never,
+      fetch: fetch as never,
+    });
+    mount(host);
+    await vi.waitFor(() => expect(container.textContent).toBe("Report 1Report 2Report 3Report 2"));
+    const labelCalls = fetch.mock.calls.filter(([url]) => String(url).endsWith("/rpc/labels"));
+    expect(labelCalls).toHaveLength(1);
+    expect(JSON.parse(String(labelCalls[0]![1]!.body))).toEqual({ ids: [1, 2, 3] });
+  });
+});
