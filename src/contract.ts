@@ -34,7 +34,7 @@ export interface SlotDef<Props = unknown> {
   readonly __props?: Props;
 }
 
-export function slot<Props extends object = Record<string, never>>(): SlotDef<Props> {
+export function slot<Props extends object = Record<never, never>>(): SlotDef<Props> {
   return { kind: "slot" };
 }
 
@@ -51,7 +51,7 @@ export interface ComponentDef<Props = unknown> {
   readonly __props?: Props;
 }
 
-export function component<Props extends object = Record<string, never>>(): ComponentDef<Props> {
+export function component<Props extends object = Record<never, never>>(): ComponentDef<Props> {
   return { kind: "component" };
 }
 

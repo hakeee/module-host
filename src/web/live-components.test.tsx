@@ -89,6 +89,8 @@ function Home() {
       <Chip name="Erik" />
       <pagesMod.Component of={peopleContract.components.PersonChip} name="Anna" />
       <Broken />
+      {/* a prop-less component takes nothing but `of` */}
+      <pagesMod.Component of={peopleContract.components.Broken} />
       <p>after broken</p>
       <Status />
     </main>

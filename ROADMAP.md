@@ -34,6 +34,8 @@ boundaries, entity links). First consumer: Ebba's people module.
   (`/_jobs`, `useJobs`, pushed live).
 - `useContractVersionCheck()` against `/_manifest`; batched `<EntityLink>`
   labels.
+- `slot()` / `component()` without props default to no props, so
+  `<mod.Component of={ref} />` type-checks (it used to demand `never`).
 - `Caller`/`Client` types moved to the root entry, so contract files can
   export typed helpers without dragging server types into browser
   type-checks.
