@@ -273,6 +273,15 @@ defineServerModule({
   - `onJob` reports every outcome.
   - On start, jobs a crash left `running` are requeued.
 - **Every declared job needs a handler**, checked at boot.
+- **"Not now":** a handler throws `JobDeferredError(retryInMs)` when a
+  dependency is down rather than the job being broken (an AI answering
+  503, say). The job is requeued that much later without counting an
+  attempt, so an outage of any length doesn't use up its retries. It just
+  waits, like a job waiting for an unlock. Plain errors still back off
+  (2s, 4s, ...) and fail after `maxAttempts`.
+- **`ctx.jobs.pendingCount(userId, name?)`**: how many of the module's jobs
+  are queued or running, e.g. to skip a catch-up run while work is in
+  flight.
 - **Schedules:** `schedules: { nightly: { job: "sweep", everyMs: 86_400_000,
   payload } }`. Each user with an unlocked session (host option
   `activeCallers`, e.g. vault-service's `sessionCache.unlockedSessions()`)

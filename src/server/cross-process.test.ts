@@ -6,7 +6,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { OperationError, defineContract } from "../contract.js";
-import { ModuleRemoteError, ModuleVaultLockedError, createServerHost, defineServerModule, type AnyServerModule } from "./index.js";
+import { JobDeferredError, ModuleRemoteError, ModuleVaultLockedError, createServerHost, defineServerModule, type AnyServerModule } from "./index.js";
 
 // Both "processes" share one vault here (in real life the worker's comes from createRemoteVault).
 const sessions = new Map<string, { userId: number; dek: Buffer }>();
@@ -279,6 +279,10 @@ describe("job visibility", () => {
     await tidyCtx.jobs.enqueue({ userId: 2, sessionId: "b1" }, "work", { secret: "other user" });
     await vi.waitFor(() => expect(got).toEqual([{ type: "jobs", module: "visible" }]));
 
+    expect(tidyCtx.jobs.pendingCount(1)).toBe(1);
+    expect(tidyCtx.jobs.pendingCount(1, "work")).toBe(1);
+    expect(tidyCtx.jobs.pendingCount(3)).toBe(0);
+
     const res = await app.inject({ method: "GET", url: "/m/visible/_jobs", headers: { "x-session": "a1" } });
     const { jobs } = res.json();
     expect(jobs).toHaveLength(1);
@@ -286,8 +290,42 @@ describe("job visibility", () => {
     expect(JSON.stringify(jobs)).not.toContain("do not show");
 
     await host.jobs.runDue();
+    expect(tidyCtx.jobs.pendingCount(1)).toBe(0);
     await vi.waitFor(() => expect(got).toHaveLength(2));
     ws.terminate();
     await app.close();
+  });
+});
+
+describe("deferred jobs", () => {
+  it("wait out a dependency's outage without spending attempts", async () => {
+    let down = true;
+    let runs = 0;
+    let ctxRef: any;
+    const flaky = defineServerModule({
+      id: "flaky",
+      jobs: { call: z.object({}) },
+      setup(ctx) {
+        ctxRef = ctx;
+        ctx.jobs.handle("call", () => {
+          runs += 1;
+          if (down) throw new JobDeferredError(60_000, "dependency down");
+        });
+      },
+    });
+    const events: string[] = [];
+    const db = memoryDb();
+    const host = createServerHost({ modules: [flaky] as AnyServerModule[], db, vaultFor, requireVault, live: false, onJob: (e) => void events.push(e.type) });
+    host.migrate();
+    const caller = unlock("d1", 9);
+    await ctxRef.jobs.enqueue(caller, "call", {});
+    const t0 = Date.now();
+    for (let i = 0; i < 10; i++) await host.jobs.runDue({ now: t0 + i * 61_000 }); // ten outages' worth - far past 3 attempts
+    expect(runs).toBe(10);
+    expect(db.$client.prepare("SELECT status, attempts FROM __module_jobs").get()).toEqual({ status: "queued", attempts: 0 });
+    down = false;
+    await host.jobs.runDue({ now: t0 + 11 * 61_000 });
+    expect(db.$client.prepare("SELECT status FROM __module_jobs").get()).toEqual({ status: "done" });
+    expect(events.filter((e) => e === "deferred")).toHaveLength(10);
   });
 });

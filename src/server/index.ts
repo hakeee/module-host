@@ -63,6 +63,21 @@ export interface LegacyCallContext extends CallContext {
 export type CallContextFor<L extends boolean> = L extends true ? LegacyCallContext : CallContext;
 
 /** Thrown when a call's session has no unlocked vault (in-process callers; HTTP gets a 423). */
+/**
+ * Thrown by a job handler for "not now" - a dependency is down (e.g. the
+ * AI answers 503) rather than the job being broken. The job is requeued
+ * `retryInMs` later *without* counting an attempt, so an outage of any
+ * length doesn't exhaust its retries; it waits, like a locked vault.
+ */
+export class JobDeferredError extends Error {
+  constructor(
+    readonly retryInMs: number,
+    message = "deferred",
+  ) {
+    super(message);
+  }
+}
+
 export class ModuleVaultLockedError extends Error {
   constructor() {
     super("vault locked");
@@ -115,6 +130,8 @@ export interface ModuleJobs<J extends JobDefs, L extends boolean> {
    * caller's vault must be unlocked. Returns the job id.
    */
   enqueue<N extends keyof J & string>(caller: Caller, name: N, payload: Input<J[N]>, options?: EnqueueOptions): Promise<number>;
+  /** How many of this module's jobs for `userId` are queued or running (optionally of one type). */
+  pendingCount(userId: number, name?: keyof J & string): number;
 }
 
 export interface ServerContext<
@@ -262,7 +279,7 @@ export interface ServerHostOptions {
 }
 
 export interface JobEvent {
-  readonly type: "done" | "retry" | "failed" | "waiting-for-vault";
+  readonly type: "done" | "retry" | "failed" | "waiting-for-vault" | "deferred";
   readonly id: number;
   readonly module: string;
   readonly name: string;
@@ -535,6 +552,16 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
         enqueue(caller, name, payload, enqueueOptions = {}) {
           return enqueueFor(runtime, caller, name, payload, enqueueOptions);
         },
+        pendingCount(userId, name) {
+          jobs().ensureTable();
+          const row = rawSqlite(options.db)
+            .prepare(
+              `SELECT count(*) AS n FROM ${JOBS_TABLE} WHERE module = ? AND user_id = ? AND status IN ('queued', 'running')` +
+                (name ? " AND name = ?" : ""),
+            )
+            .get(...(name ? [module.id, userId, name] : [module.id, userId])) as { n: number };
+          return row.n;
+        },
       },
     };
     if (module.contract) {
@@ -585,6 +612,12 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
       options.onJob?.({ ...event, type: "done" });
       publishLive(row.user_id, { type: "jobs", module: row.module });
     } catch (error) {
+      if (error instanceof JobDeferredError) {
+        jobs().defer(row.id, now + Math.max(1000, error.retryInMs));
+        options.onJob?.({ ...event, type: "deferred" });
+        publishLive(row.user_id, { type: "jobs", module: row.module });
+        return;
+      }
       const code = error instanceof Error ? error.constructor.name : "UnknownError";
       const outcome = jobs().fail(row, code, now + retryDelayMs(row.attempts));
       options.onJob?.({ ...event, type: outcome, error: code });

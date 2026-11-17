@@ -40,6 +40,12 @@ boundaries, entity links). First consumer: Ebba's people module.
   export typed helpers without dragging server types into browser
   type-checks.
 
+## v0.4 (done)
+
+- `JobDeferredError`: wait out a dependency's outage without spending
+  attempts.
+- `ctx.jobs.pendingCount`.
+
 ## Next
 
 - **Cross-process event subscriptions:** a module in the API subscribing
