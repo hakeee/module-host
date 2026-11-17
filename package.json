@@ -36,6 +36,7 @@
     "test": "vitest run"
   },
   "peerDependencies": {
+    "@fastify/websocket": "^11.0.0",
     "@hakeee/vault-service": "^0.2.0",
     "@tanstack/react-query": "^5.0.0",
     "drizzle-orm": "^0.45.0",
@@ -57,10 +58,14 @@
     },
     "@hakeee/vault-service": {
       "optional": true
+    },
+    "@fastify/websocket": {
+      "optional": true
     }
   },
   "devDependencies": {
     "@fastify/secure-session": "^8.4.1",
+    "@fastify/websocket": "11.2.0",
     "@hakeee/vault-service": "link:../vault-service/packages/server",
     "@tanstack/react-query": "^5.104.2",
     "@types/better-sqlite3": "^7.6.13",

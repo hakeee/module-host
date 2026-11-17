@@ -13,7 +13,9 @@ import {
   Component,
   createContext,
   useContext,
+  useEffect,
   useMemo,
+  useRef,
   useSyncExternalStore,
   type ComponentType,
   type MouseEvent,
@@ -24,7 +26,9 @@ import {
   isContract,
   operationsOf,
   type AnyContract,
+  type ComponentRef,
   type EntityRef,
+  type EventRef,
   type OperationDef,
   type OperationRef,
   type PageRef,
@@ -32,7 +36,10 @@ import {
 } from "../contract.js";
 import { ModuleCompositionError, resolveModules, visibleContracts } from "../resolve.js";
 import { validate, validateSync, type Input, type Output } from "../standardSchema.js";
+import { createLiveClient, type LiveClient, type LiveStatus } from "./live.js";
 import { browserHistory, buildHref, compileRoute, matchRoute, sortRoutes, type CompiledRoute, type RouterHistory } from "./router.js";
+
+export type { LiveStatus } from "./live.js";
 
 export { browserHistory, memoryHistory, type RouterHistory } from "./router.js";
 
@@ -43,6 +50,7 @@ export type AnyWebModule = WebModule<any, any>;
 type Requirement = AnyWebModule | AnyContract;
 type ContractOf<R> = R extends AnyContract ? R : R extends { readonly contract: infer C } ? (C extends AnyContract ? C : never) : never;
 type OwnContract<C> = C extends AnyContract ? C : never;
+type VisibleId<C, R extends readonly unknown[]> = (ContractOf<R[number]> | OwnContract<C>)["id"];
 
 export type PageProps<P extends PageRef> = { params: Output<P["params"]> };
 
@@ -80,7 +88,17 @@ export function contribute<Props>(slot: SlotRef<string, string, Props>, componen
   return { slot, component, order: options.order ?? 100 };
 }
 
-export type WebModuleParts<C extends AnyContract | undefined> = PagesOf<C> & {
+type ComponentsOf<C> = C extends AnyContract
+  ? keyof C["components"] extends never
+    ? { readonly components?: Record<string, never> }
+    : {
+        readonly components: {
+          readonly [K in keyof C["components"]]: C["components"][K] extends ComponentRef<string, string, infer P> ? ComponentType<P> : never;
+        };
+      }
+  : { readonly components?: Record<string, never> };
+
+export type WebModuleParts<C extends AnyContract | undefined> = PagesOf<C> & ComponentsOf<C> & {
   // biome-ignore lint: nav targets are validated at runtime against visible contracts
   readonly nav?: readonly NavItem<any>[];
   // biome-ignore lint: see above
@@ -101,6 +119,24 @@ export interface WebModuleBuilder<C extends AnyContract | undefined, R extends r
   readonly requires: R;
   /** Typed data hooks for this module's own contract or one it requires. Anything else is a type error. */
   useModule<U extends ContractOf<R[number]> | OwnContract<C>>(contract: U): ContractHooks<U>;
+  /**
+   * A UI component another module offers through its contract (or this
+   * module's own). Renders inside an error boundary; renders `null` if no
+   * installed web module implements it (e.g. a backend-only install).
+   */
+  useComponent<Props>(component: ComponentRef<VisibleId<C, R>, string, Props>): ComponentType<Props>;
+  /**
+   * The element form of `useComponent`: `<mod.Component of={ref} {...props} />`.
+   * Same checks and boundary; reads better in JSX and keeps lint rules
+   * about components created during render quiet.
+   */
+  readonly Component: <Props extends object>(props: { of: ComponentRef<VisibleId<C, R>, string, Props> } & Props) => ReactNode;
+  /** Runs `handler` for each live event of a visible contract (see `<LiveConnection>`). */
+  useLiveEvent<U extends ContractOf<R[number]> | OwnContract<C>, E extends keyof U["events"] & string>(
+    contract: U,
+    event: E,
+    handler: (payload: Output<U["events"][E] extends EventRef<string, string, infer S> ? S : never>) => void,
+  ): void;
   /** Pages (one per page in the contract), nav entries and slot contributions. */
   define(parts: WebModuleParts<C>): WebModule<C, R>;
 }
@@ -142,6 +178,22 @@ export function webModule<const C extends AnyContract | undefined = undefined, c
     useModule(target) {
       if (!visible.has(target.id)) throw new ModuleCompositionError(`"${id}" uses contract "${target.id}" without requiring it`);
       return useContractHooks(target);
+    },
+    useComponent(ref) {
+      if (!visible.has(ref.contractId)) throw new ModuleCompositionError(`"${id}" uses a component of "${ref.contractId}" without requiring it`);
+      const { host } = useHostContext();
+      return host.exposedComponent(ref as ComponentRef) as never;
+    },
+    Component: function ModuleComponent(props) {
+      const { of: ref, ...rest } = props as { of: ComponentRef } & Record<string, unknown>;
+      if (!visible.has(ref.contractId)) throw new ModuleCompositionError(`"${id}" uses a component of "${ref.contractId}" without requiring it`);
+      const { host } = useHostContext();
+      const Exposed = host.exposedComponent(ref);
+      return <Exposed {...rest} />;
+    } as WebModuleBuilder<C, R>["Component"],
+    useLiveEvent(target, event, handler) {
+      if (!visible.has(target.id)) throw new ModuleCompositionError(`"${id}" listens to "${target.id}" without requiring it`);
+      useLiveSubscription(target.id, event, handler as (payload: unknown) => void);
     },
     define(parts) {
       return { kind: "web-module", id, contract, requires, parts };
@@ -240,6 +292,10 @@ export interface WebHostOptions {
   /** Where `/` goes when no page claims it. */
   home?: PageRef;
   fetch?: typeof fetch;
+  /** WebSocket URL for live updates. Default: `baseUrl` with ws(s):// and `/_live`. */
+  liveUrl?: string;
+  /** For tests. */
+  WebSocket?: typeof WebSocket;
 }
 
 interface ResolvedNavItem {
@@ -260,6 +316,9 @@ export interface WebHost {
   readonly nav: readonly ResolvedNavItem[];
   readonly home: PageRef | undefined;
   componentFor(page: PageRef): ComponentType<{ params: unknown }> | undefined;
+  /** A stable wrapper for a contract component: boundary + implementation, or `null` when none is installed. */
+  exposedComponent(ref: ComponentRef): ComponentType<unknown>;
+  readonly live: LiveClient;
   contributionsFor(slot: SlotRef): readonly Contribution[];
   href<P extends PageRef>(page: P, params?: Output<P["params"]>): string;
   rpc(contractId: string, op: string, input: unknown): Promise<unknown>;
@@ -296,6 +355,54 @@ export function createWebHost(options: WebHostOptions): WebHost {
       if (!contract || !(name in contract.pages)) throw new ModuleCompositionError(`web "${module.id}" has a component for unknown page "${name}"`);
     }
   }
+
+  const componentImpls = new Map<string, ComponentType<unknown>>();
+  for (const module of modules) {
+    const contract = module.contract as AnyContract | undefined;
+    const given = (module.parts.components ?? {}) as Record<string, ComponentType<unknown>>;
+    for (const name of Object.keys((contract?.components ?? {}) as Record<string, ComponentRef>)) {
+      const impl = given[name];
+      if (!impl) throw new ModuleCompositionError(`web "${module.id}" has no implementation for component "${name}"`);
+      componentImpls.set(`${contract!.id}.${name}`, impl);
+    }
+    for (const name of Object.keys(given)) {
+      if (!contract || !(name in contract.components)) {
+        throw new ModuleCompositionError(`web "${module.id}" implements unknown component "${name}"`);
+      }
+    }
+  }
+  const wrappers = new Map<string, ComponentType<unknown>>();
+  const exposedComponent = (ref: ComponentRef): ComponentType<unknown> => {
+    const key = pageKey(ref);
+    let wrapper = wrappers.get(key);
+    if (!wrapper) {
+      const Impl = componentImpls.get(key);
+      const Wrapped = (props: unknown) =>
+        Impl ? (
+          <ContributionBoundary label={`component ${key}`}>
+            <Impl {...(props as object)} />
+          </ContributionBoundary>
+        ) : null;
+      Wrapped.displayName = `Module(${key})`;
+      wrapper = Wrapped;
+      wrappers.set(key, wrapper);
+    }
+    return wrapper;
+  };
+
+  const knownContracts = new Map<string, AnyContract>();
+  for (const module of modules) {
+    if (module.contract) knownContracts.set(module.contract.id, module.contract as AnyContract);
+    for (const requirement of module.requires as readonly Requirement[]) {
+      const contract = isContract(requirement) ? requirement : (requirement.contract as AnyContract | undefined);
+      if (contract) knownContracts.set(contract.id, contract);
+    }
+  }
+  const live = createLiveClient({
+    url: options.liveUrl ?? options.baseUrl.replace(/^http/, "ws") + "/_live",
+    contracts: knownContracts,
+    WebSocketImpl: options.WebSocket,
+  });
 
   for (const module of modules) {
     const visible = visibleContracts(module);
@@ -337,6 +444,8 @@ export function createWebHost(options: WebHostOptions): WebHost {
     nav,
     home: options.home,
     componentFor: (page) => pageComponents.get(pageKey(page)),
+    exposedComponent,
+    live,
     contributionsFor: (slot) => contributions.get(pageKey(slot)) ?? [],
     href: (page, params) => buildHref(page, params as Record<string, unknown> | undefined),
     async rpc(contractId, op, input) {
@@ -511,6 +620,45 @@ class ContributionBoundary extends Component<{ label: string; children: ReactNod
   override render() {
     return this.state.failed ? null : this.props.children;
   }
+}
+
+/**
+ * Opens the live-update socket while mounted. Place it where the vault is
+ * known to be unlocked (the server refuses the socket otherwise). Incoming
+ * events refetch the queries their contract names in `invalidates`, run
+ * `useLiveEvent` handlers, and after a reconnect every live contract's
+ * queries are refetched, since events may have been missed meanwhile.
+ */
+export function LiveConnection() {
+  const { host } = useHostContext();
+  const queryClient = useQueryClient();
+  useEffect(
+    () =>
+      host.live.connect({
+        invalidate: (contractId, query) =>
+          void queryClient.invalidateQueries({ queryKey: query ? [contractId, query] : [contractId] }),
+        onReconnect: (contractIds) => {
+          for (const id of contractIds) void queryClient.invalidateQueries({ queryKey: [id] });
+        },
+      }),
+    [host, queryClient],
+  );
+  return null;
+}
+
+/** "idle" (no `<LiveConnection>` mounted), "connecting", "open" or "closed" (retrying). */
+export function useLiveStatus(): LiveStatus {
+  const { host } = useHostContext();
+  return useSyncExternalStore(host.live.subscribeStatus, host.live.status, host.live.status);
+}
+
+function useLiveSubscription(contractId: string, event: string, handler: (payload: unknown) => void) {
+  const { host } = useHostContext();
+  const latest = useRef(handler);
+  useEffect(() => {
+    latest.current = handler;
+  });
+  useEffect(() => host.live.subscribe(contractId, event, (payload) => latest.current(payload)), [host, contractId, event]);
 }
 
 /**

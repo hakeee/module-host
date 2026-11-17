@@ -13,9 +13,13 @@ import {
 } from "../contract.js";
 import { ModuleCompositionError, resolveModules, visibleContracts } from "../resolve.js";
 import { ContractInputError, ContractValidationError, validate, type Input, type Output, type Schema } from "../standardSchema.js";
+import { createJobStore, retryDelayMs, type JobRow, type JobStore, type RawSqlite } from "./jobs.js";
+import { createLiveHub, type LiveHub } from "./live.js";
 import { checkTables } from "./tables.js";
 
 export { checkTables, tablesOf } from "./tables.js";
+export { JOBS_TABLE, retryDelayMs } from "./jobs.js";
+export { LIVE_CLOSE_VAULT_LOCKED, type LiveMessage } from "./live.js";
 
 // --- the app's database type ------------------------------------------------
 
@@ -104,7 +108,33 @@ type EventPayload<C extends AnyContract, E extends keyof C["events"]> = C["event
     : never
   : never;
 
-export interface ServerContext<C extends AnyContract | undefined, R extends readonly Requirement[], L extends boolean> {
+/** A module's job types: name -> payload schema. Private to the module (others trigger work via commands/events). */
+export type JobDefs = Readonly<Record<string, Schema>>;
+
+export interface EnqueueOptions {
+  /** Run no earlier than this many ms from now. */
+  delayMs?: number;
+  /** Attempts before the job is marked failed. Default 3. */
+  maxAttempts?: number;
+}
+
+export interface ModuleJobs<J extends JobDefs, L extends boolean> {
+  /** The handler for one of this module's job types. Every declared job needs exactly one. */
+  handle<N extends keyof J & string>(name: N, handler: (call: CallContextFor<L>, payload: Output<J[N]>) => Promise<void> | void): void;
+  /**
+   * Queues a job on behalf of `caller`. The payload is validated, then
+   * encrypted with this module's vault scope before it's stored - so the
+   * caller's vault must be unlocked. Returns the job id.
+   */
+  enqueue<N extends keyof J & string>(caller: Caller, name: N, payload: Input<J[N]>, options?: EnqueueOptions): Promise<number>;
+}
+
+export interface ServerContext<
+  C extends AnyContract | undefined,
+  R extends readonly Requirement[],
+  L extends boolean,
+  J extends JobDefs = {},
+> {
   readonly id: string;
   /** The shared database (typed via `Register`). Touch only your own tables; reach others' data through contracts. */
   readonly db: ModuleDb;
@@ -128,9 +158,16 @@ export interface ServerContext<C extends AnyContract | undefined, R extends read
   requireCall(request: FastifyRequest, reply: FastifyReply): CallContextFor<L> | undefined;
   /** This module's call context for a caller, e.g. a session id stored with a job. */
   callFor(caller: Caller): CallContextFor<L>;
+  /** Background jobs declared in the module's `jobs`. */
+  readonly jobs: ModuleJobs<J, L>;
 }
 
-export interface ServerModuleDef<C extends AnyContract | undefined, R extends readonly Requirement[], L extends boolean> {
+export interface ServerModuleDef<
+  C extends AnyContract | undefined,
+  R extends readonly Requirement[],
+  L extends boolean,
+  J extends JobDefs = {},
+> {
   /** Defaults to the contract's id. Required for modules without a contract. */
   readonly id?: string;
   readonly contract?: C;
@@ -145,35 +182,39 @@ export interface ServerModuleDef<C extends AnyContract | undefined, R extends re
   /** Exposes `call.legacy` (vault-service's legacy scope) for data written before scopes existed. */
   readonly legacyEncryption?: L;
   /** Handlers for every contract operation - an object, or built from the module's context (for `ctx.db`, `ctx.use`). */
-  readonly implement?: C extends AnyContract ? Implementation<C, L> | ((ctx: ServerContext<C, R, L>) => Implementation<C, L>) : never;
-  readonly setup?: (ctx: ServerContext<C, R, L>) => void;
+  readonly implement?: C extends AnyContract ? Implementation<C, L> | ((ctx: ServerContext<C, R, L, J>) => Implementation<C, L>) : never;
+  /** Background job types (name -> payload schema); handlers are registered in `setup` with `ctx.jobs.handle`. */
+  readonly jobs?: J;
+  readonly setup?: (ctx: ServerContext<C, R, L, J>) => void;
 }
 
 export interface ServerModule<
   C extends AnyContract | undefined = AnyContract | undefined,
   R extends readonly Requirement[] = readonly Requirement[],
   L extends boolean = boolean,
+  J extends JobDefs = JobDefs,
 > {
   readonly kind: "server-module";
   readonly id: string;
   readonly contract: C;
   readonly requires: R;
-  readonly def: ServerModuleDef<C, R, L>;
+  readonly def: ServerModuleDef<C, R, L, J>;
 }
 
 // biome-ignore lint: the "any server module" bound
-export type AnyServerModule = ServerModule<any, any, any>;
+export type AnyServerModule = ServerModule<any, any, any, any>;
 
 export function defineServerModule<
   const C extends AnyContract | undefined = undefined,
   const R extends readonly Requirement[] = readonly [],
   const L extends boolean = false,
+  const J extends JobDefs = {},
 >(
-  def: ServerModuleDef<C, R, L> &
+  def: ServerModuleDef<C, R, L, J> &
     (C extends AnyContract
-      ? { readonly implement: Implementation<C, L> | ((ctx: ServerContext<C, R, L>) => Implementation<C, L>) }
+      ? { readonly implement: Implementation<C, L> | ((ctx: ServerContext<C, R, L, J>) => Implementation<C, L>) }
       : { readonly id: string }),
-): ServerModule<C, R, L> {
+): ServerModule<C, R, L, J> {
   const id = def.id ?? def.contract?.id;
   if (!id) throw new Error("a server module without a contract needs an id");
   assertModuleId(id);
@@ -202,6 +243,37 @@ export interface ServerHostOptions {
   /** Tables outside any module that modules may reference, e.g. `["user"]`. */
   sharedTables?: readonly string[];
   logError?: (error: unknown, message: string) => void;
+  /**
+   * Live updates over WebSocket at `<prefix>/_live` (default on). Needs
+   * `@fastify/websocket` installed. Set `origins` to your web app's origins:
+   * browsers send cookies with WebSocket handshakes and CORS doesn't apply.
+   */
+  live?: false | { heartbeatMs?: number; origins?: readonly string[] };
+  /**
+   * Called before a job runs, with its vault session - for processes whose
+   * `vaultFor` is backed by a remote vault that must fetch keys first (see
+   * DESIGN.md "Background jobs").
+   */
+  prepareVault?: (sessionId: string) => Promise<void>;
+  /** Observability for the job runner - e.g. log jobs waiting on a locked vault. */
+  onJob?: (event: JobEvent) => void;
+}
+
+export interface JobEvent {
+  readonly type: "done" | "retry" | "failed" | "waiting-for-vault";
+  readonly id: number;
+  readonly module: string;
+  readonly name: string;
+  readonly sessionId: string;
+  /** The error's class name only - never its message, which could echo decrypted content. */
+  readonly error?: string;
+}
+
+export interface JobRunner {
+  /** Runs due jobs one at a time until none are left (or `limit` ran). Returns how many ran. */
+  runDue(options?: { now?: number; limit?: number }): Promise<number>;
+  /** Polls for due jobs until the returned function is called. Requeues jobs a crash left `running`. */
+  start(options?: { pollMs?: number }): () => void;
 }
 
 interface Runtime {
@@ -209,6 +281,7 @@ interface Runtime {
   visible: Set<string>;
   routePlugins: ((app: FastifyInstance) => Promise<void> | void)[];
   handlers: Record<string, (call: CallContext, input: unknown) => unknown>;
+  jobHandlers: Record<string, (call: CallContext, payload: unknown) => Promise<void> | void>;
 }
 
 type Subscriber = { runtime: Runtime; handler: (call: CallContext, payload: unknown) => Promise<void> | void };
@@ -222,13 +295,24 @@ export interface ServerHost {
   routes(app: FastifyInstance): Promise<void>;
   /** An unrestricted client, for app code that isn't a module yet. */
   client<C extends AnyContract>(contract: C): Client<C>;
+  /** Runs this host's modules' background jobs (only theirs - a worker process can host a subset). */
+  readonly jobs: JobRunner;
+  /** Open live-update sockets (for tests and diagnostics). */
+  liveConnectionCount(): number;
 }
 
 export function migrationsTableFor(moduleId: string): string {
   return `__module_${moduleId.replaceAll("-", "_")}_migrations`;
 }
 
+function rawSqlite(db: ModuleDb): RawSqlite {
+  const client = (db as unknown as { $client?: RawSqlite }).$client;
+  if (!client) throw new Error("module-host: the database must be a drizzle better-sqlite3 instance");
+  return client;
+}
+
 function migrateResolved(db: ModuleDb, modules: readonly AnyServerModule[]): void {
+  if (modules.some((m) => Object.keys(m.def.jobs ?? {}).length > 0)) createJobStore(rawSqlite(db)).ensureTable();
   for (const module of modules) {
     if (!module.def.migrationsFolder) continue;
     // The app's drizzle copy, not necessarily ours - same runtime shape.
@@ -259,6 +343,13 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
   const runtimes = new Map<string, Runtime>();
   const providerOf = new Map<string, Runtime>();
   const subscribers = new Map<string, Subscriber[]>();
+  const live: LiveHub | undefined =
+    options.live === false
+      ? undefined
+      : createLiveHub({ vaultFor: options.vaultFor, heartbeatMs: options.live?.heartbeatMs, origins: options.live?.origins });
+  const jobModules = modules.filter((m) => Object.keys(m.def.jobs ?? {}).length > 0).map((m) => m.id);
+  let jobStore: JobStore | undefined;
+  const jobs = () => (jobStore ??= createJobStore(rawSqlite(options.db)));
 
   const buildCall = (runtime: Runtime, caller: Caller, vault: VaultHandle): CallContext => {
     const base: CallContext = { userId: caller.userId, sessionId: caller.sessionId, vault: vault.scope(runtime.module.id) };
@@ -310,10 +401,13 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
         logError(error, `"${runtime.module.id}" failed handling ${contract.id}.${event}`);
       }
     }
+    if ((ref as { live?: boolean }).live && live) {
+      live.publish(caller.userId, { type: "event", contract: contract.id, event, payload });
+    }
   };
 
   for (const module of modules) {
-    const runtime: Runtime = { module, visible: visibleContracts(module), routePlugins: [], handlers: {} };
+    const runtime: Runtime = { module, visible: visibleContracts(module), routePlugins: [], handlers: {}, jobHandlers: {} };
     runtimes.set(module.id, runtime);
     if (module.contract) providerOf.set(module.contract.id, runtime);
   }
@@ -352,6 +446,28 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
       callFor(caller) {
         return callFor(runtime, caller) as never;
       },
+      jobs: {
+        handle(name, handler) {
+          if (!(name in (module.def.jobs ?? {}))) throw new ModuleCompositionError(`"${module.id}" handles undeclared job "${name}"`);
+          if (runtime.jobHandlers[name]) throw new ModuleCompositionError(`"${module.id}" handles job "${name}" twice`);
+          runtime.jobHandlers[name] = handler as Runtime["jobHandlers"][string];
+        },
+        async enqueue(caller, name, payload, enqueueOptions = {}) {
+          const schema = (module.def.jobs ?? {})[name];
+          if (!schema) throw new Error(`"${module.id}" has no job "${name}"`);
+          const valid = await validate(schema, payload, `${module.id} job ${name}`);
+          const call = callFor(runtime, caller);
+          return jobs().insert({
+            module: module.id,
+            name,
+            userId: caller.userId,
+            sessionId: caller.sessionId,
+            payload: call.vault.encryptString(`job:${name}`, JSON.stringify(valid)),
+            maxAttempts: enqueueOptions.maxAttempts ?? 3,
+            runAt: Date.now() + (enqueueOptions.delayMs ?? 0),
+          });
+        },
+      },
     };
     if (module.contract) {
       const given = typeof module.def.implement === "function" ? module.def.implement(ctx as never) : module.def.implement;
@@ -369,14 +485,88 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
       runtime.handlers = handlers as Runtime["handlers"];
     }
     module.def.setup?.(ctx as never);
+    for (const name of Object.keys(module.def.jobs ?? {})) {
+      if (!runtime.jobHandlers[name]) throw new ModuleCompositionError(`"${module.id}" declares job "${name}" but never handles it`);
+    }
   }
+
+  const LOCKED_RETRY_MS = 30_000;
+
+  const runJob = async (row: JobRow, now: number) => {
+    const runtime = runtimes.get(row.module)!;
+    const event = { id: row.id, module: row.module, name: row.name, sessionId: row.session_id };
+    const caller = { userId: row.user_id, sessionId: row.session_id };
+    let call: CallContext;
+    try {
+      await options.prepareVault?.(row.session_id);
+      call = callFor(runtime, caller);
+    } catch (error) {
+      if (!(error instanceof ModuleVaultLockedError)) throw error;
+      // Nothing ran, so this isn't an attempt - wait for the next unlock.
+      jobs().defer(row.id, now + LOCKED_RETRY_MS);
+      options.onJob?.({ ...event, type: "waiting-for-vault" });
+      return;
+    }
+    try {
+      const handler = runtime.jobHandlers[row.name];
+      if (!handler) throw new ModuleCompositionError(`no handler for job "${row.name}"`);
+      const schema = (runtime.module.def.jobs ?? {})[row.name]!;
+      const payload = await validate(schema, JSON.parse(call.vault.decryptString(`job:${row.name}`, row.payload)), `${row.module} job ${row.name}`);
+      await handler(call, payload);
+      jobs().done(row.id);
+      options.onJob?.({ ...event, type: "done" });
+    } catch (error) {
+      const code = error instanceof Error ? error.constructor.name : "UnknownError";
+      const outcome = jobs().fail(row, code, now + retryDelayMs(row.attempts));
+      options.onJob?.({ ...event, type: outcome, error: code });
+      if (outcome === "failed") logError(error, `job ${row.module}.${row.name} #${row.id} failed for good`);
+    }
+  };
+
+  const jobRunner: JobRunner = {
+    async runDue({ now, limit = Number.POSITIVE_INFINITY } = {}) {
+      if (jobModules.length === 0) return 0;
+      let ran = 0;
+      while (ran < limit) {
+        const at = now ?? Date.now();
+        const row = jobs().claimNext(jobModules, at);
+        if (!row) break;
+        await runJob(row, at);
+        ran += 1;
+      }
+      return ran;
+    },
+    start({ pollMs = 1000 } = {}) {
+      if (jobModules.length === 0) return () => {};
+      jobs().ensureTable();
+      jobs().recoverRunning(jobModules);
+      let stopped = false;
+      let timer: NodeJS.Timeout | undefined;
+      const tick = async () => {
+        try {
+          await jobRunner.runDue();
+        } catch (error) {
+          logError(error, "module-host: job runner tick failed");
+        }
+        if (!stopped) timer = setTimeout(tick, pollMs);
+      };
+      timer = setTimeout(tick, 0);
+      return () => {
+        stopped = true;
+        if (timer) clearTimeout(timer);
+      };
+    },
+  };
 
   return {
     modules,
     migrate() {
       migrateResolved(options.db, modules);
     },
+    jobs: jobRunner,
+    liveConnectionCount: () => live?.connectionCount() ?? 0,
     async routes(app) {
+      if (live) await live.register(app, options.requireVault);
       app.get("/_manifest", async () => ({
         modules: modules.map((m) => ({ id: m.id, contract: m.contract ? { id: m.contract.id, version: m.contract.version } : null })),
       }));

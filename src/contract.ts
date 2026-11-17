@@ -33,6 +33,37 @@ export function slot<Props extends object = Record<string, never>>(): SlotDef<Pr
 }
 
 /**
+ * A UI component this module offers to others - a person picker, a chip.
+ * Like a slot it's type-only (props are passed in-process); unlike a slot
+ * it has exactly one implementation, provided by the web module that
+ * implements this contract. Consumers get it with `mod.useComponent(ref)`,
+ * so they depend on the contract, never on the provider's code.
+ */
+export interface ComponentDef<Props = unknown> {
+  readonly kind: "component";
+  /** Phantom field carrying `Props`; never set. */
+  readonly __props?: Props;
+}
+
+export function component<Props extends object = Record<string, never>>(): ComponentDef<Props> {
+  return { kind: "component" };
+}
+
+/**
+ * An event, in its full form. The short form is just the payload schema.
+ *
+ * - `live: true` also pushes it to the emitting user's browsers over the
+ *   host's WebSocket (opt-in: an event's payload goes to the client).
+ * - `invalidates` names this contract's queries to refetch in the browser
+ *   when it arrives - live updates with no client code at all.
+ */
+export interface EventDef<S extends Schema = Schema> {
+  readonly payload: S;
+  readonly live?: boolean;
+  readonly invalidates?: readonly string[];
+}
+
+/**
  * Something other modules can point at by id - a person, a tag, an entry.
  * `page` is a page of this contract with an `id` param; `labels` is a query
  * of this contract taking `{ ids: number[] }` and returning
@@ -51,9 +82,10 @@ export interface ContractDef {
   readonly version: number;
   readonly queries?: Readonly<Record<string, OperationDef>>;
   readonly commands?: Readonly<Record<string, OperationDef>>;
-  readonly events?: Readonly<Record<string, Schema>>;
+  readonly events?: Readonly<Record<string, Schema | EventDef>>;
   readonly pages?: Readonly<Record<string, PageDef>>;
   readonly slots?: Readonly<Record<string, SlotDef<any>>>;
+  readonly components?: Readonly<Record<string, ComponentDef<any>>>;
   readonly entities?: Readonly<Record<string, EntityDef>>;
 }
 
@@ -75,7 +107,19 @@ export interface EventRef<Id extends string = string, Name extends string = stri
   readonly contractId: Id;
   readonly name: Name;
   readonly payload: S;
+  readonly live: boolean;
+  readonly invalidates: readonly string[];
 }
+
+export interface ComponentRef<Id extends string = string, Name extends string = string, Props = unknown> extends ComponentDef<Props> {
+  readonly contractId: Id;
+  readonly name: Name;
+}
+
+/** The props a contract component takes - for typing its implementation. */
+export type ComponentPropsOf<R> = R extends ComponentRef<string, string, infer P> ? P : never;
+
+type PayloadOf<E> = E extends { readonly payload: infer S } ? Narrow<S, Schema> : Narrow<E, Schema>;
 
 export interface PageRef<Id extends string = string, Name extends string = string, Def extends PageDef = PageDef> extends PageDef {
   readonly contractId: Id;
@@ -106,7 +150,7 @@ export type Contract<C extends ContractDef = ContractDef> = {
     readonly [K in keyof Section<C, "commands"> & string]: OperationRef<C["id"], K, Narrow<Section<C, "commands">[K], OperationDef>>;
   };
   readonly events: {
-    readonly [K in keyof Section<C, "events"> & string]: EventRef<C["id"], K, Narrow<Section<C, "events">[K], Schema>>;
+    readonly [K in keyof Section<C, "events"> & string]: EventRef<C["id"], K, PayloadOf<Section<C, "events">[K]>>;
   };
   readonly pages: {
     readonly [K in keyof Section<C, "pages"> & string]: PageRef<C["id"], K, Narrow<Section<C, "pages">[K], PageDef>>;
@@ -118,10 +162,25 @@ export type Contract<C extends ContractDef = ContractDef> = {
       Section<C, "slots">[K] extends SlotDef<infer P> ? P : never
     >;
   };
+  readonly components: {
+    readonly [K in keyof Section<C, "components"> & string]: ComponentRef<
+      C["id"],
+      K,
+      Section<C, "components">[K] extends ComponentDef<infer P> ? P : never
+    >;
+  };
   readonly entities: { readonly [K in keyof Section<C, "entities"> & string]: EntityRef<C["id"], K> };
 };
 
 export type AnyContract = Contract<ContractDef>;
+
+type EventConstraint<C extends ContractDef> = {
+  readonly events?: {
+    readonly [K in keyof Section<C, "events">]: Section<C, "events">[K] extends { readonly payload: unknown }
+      ? { readonly payload: Schema; readonly live?: boolean; readonly invalidates?: readonly (keyof Section<C, "queries"> & string)[] }
+      : Schema;
+  };
+};
 
 type EntityConstraint<C extends ContractDef> = {
   readonly entities?: {
@@ -142,7 +201,7 @@ export function assertModuleId(id: string, what = "module id"): void {
  * Declares a module's public surface. This object (and the zod schemas in
  * it) is the only thing another module may import from it.
  */
-export function defineContract<const C extends ContractDef>(def: C & EntityConstraint<C>): Contract<C> {
+export function defineContract<const C extends ContractDef>(def: C & EntityConstraint<C> & EventConstraint<C>): Contract<C> {
   assertModuleId(def.id, "contract id");
   if (!Number.isInteger(def.version) || def.version < 1) {
     throw new Error(`contract "${def.id}": version must be a positive integer`);
@@ -178,9 +237,16 @@ export function defineContract<const C extends ContractDef>(def: C & EntityConst
     version: def.version,
     queries,
     commands,
-    events: refs(def.events, (name, payload) => ({ contractId: def.id, name, payload })),
+    events: refs(def.events, (name, event) => {
+      const full: EventDef = isEventDef(event) ? event : { payload: event };
+      for (const query of full.invalidates ?? []) {
+        if (!queries[query]) throw new Error(`contract "${def.id}": event "${name}" invalidates unknown query "${query}"`);
+      }
+      return { contractId: def.id, name, payload: full.payload, live: full.live ?? false, invalidates: full.invalidates ?? [] };
+    }),
     pages,
     slots: refs(def.slots, (name, s) => ({ ...s, contractId: def.id, name })),
+    components: refs(def.components, (name, c) => ({ ...c, contractId: def.id, name })),
     entities,
   } as unknown as Contract<C>;
 }
@@ -197,6 +263,10 @@ export class OperationError extends Error {
     super(message);
     this.status = status;
   }
+}
+
+function isEventDef(value: Schema | EventDef): value is EventDef {
+  return !("~standard" in value) && "payload" in value;
 }
 
 export function isContract(value: unknown): value is AnyContract {
