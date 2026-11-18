@@ -284,6 +284,8 @@ export interface ServerHostOptions {
    * provides one.
    */
   authorize?(caller: Caller, action: string): boolean | Promise<boolean>;
+  /** Actions checked outside the modules (e.g. vault-service's self-service ones), so `actions()` and policy editors list them. */
+  extraActions?: readonly ActionInfo[];
   /** Tables outside any module that modules may reference, e.g. `["user"]`. */
   sharedTables?: readonly string[];
   logError?: (error: unknown, message: string) => void;
@@ -562,7 +564,7 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
   const allActions: ActionInfo[] = modules.flatMap((m) => [
     ...(m.contract ? actionsOf(m.contract) : []),
     ...Object.keys(m.def.jobs ?? {}).map((name) => ({ action: `${m.id}:${name}`, kind: "job" as const })),
-  ]);
+  ]).concat(options.extraActions ?? []);
 
   for (const module of modules) {
     const runtime: Runtime = { module, visible: visibleContracts(module), routePlugins: [], handlers: {}, jobHandlers: {} };

@@ -754,6 +754,13 @@ export function useCan(action: string): boolean {
   return access.ready && access.can(action);
 }
 
+/** Like `useCan`, but tells "still loading" apart from "denied" - for explaining a missing feature without flashing it. */
+export function useAccessState(action: string): "allowed" | "denied" | "loading" {
+  const access = useContext(AccessContext);
+  if (!access.ready) return "loading";
+  return access.can(action) ? "allowed" : "denied";
+}
+
 /** Renders `children` only when `action` is allowed, else `fallback`. */
 export function IfCan({ action, children, fallback = null }: { action: string; children: ReactNode; fallback?: ReactNode }) {
   return <>{useCan(action) ? children : fallback}</>;

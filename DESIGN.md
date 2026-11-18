@@ -407,6 +407,17 @@ Every operation is an **action**: `module:operation` (`notes:list`,
   - The web part is headless (`<IamAccess>`, `useRefreshAccess`). Apps build
     the admin pages for `iamContract.pages` themselves, like they build
     their auth screens.
+  - Admin actions on other accounts: `iam:disableUser` / `enableUser`,
+    `iam:resetPassword` (login password only; a vault passphrase can't be
+    reset), `iam:revokeSessions`. They never apply to root, and you can't
+    disable yourself. Each needs the matching `accounts` method
+    (vault-service's account store has them all).
+  - **Self-service actions** (kind `self-service`, passed to the host as
+    `extraActions`, e.g. vault-service's `SELF_SERVICE_ACTIONS`) are allowed
+    unless a policy explicitly denies them, so people can manage their own
+    security by default. Pass the same `authorize` to vault-service's routes.
+    `myAccess.selfService` tells the UI which are denied
+    (`useAccessState` / `useCan`).
   - Permissions decide what someone may *do*. They can't open another
     user's vault: encrypted data stays readable only by its owner, root
     included.

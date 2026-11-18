@@ -60,6 +60,15 @@ export function evaluate(
   return allowed;
 }
 
+/** Whether some statement explicitly denies `action` - the only thing that refuses a `self-service` action. */
+export function isDenied(
+  statements: readonly PolicyStatement[],
+  action: string,
+  kindOf: (action: string) => ActionKind | undefined = () => undefined,
+): boolean {
+  return statements.some((statement) => statement.effect === "deny" && applies(statement, action, kindOf));
+}
+
 /** Policies every IAM install has. They can't be edited or deleted. */
 export const MANAGED_POLICIES: Readonly<Record<string, { description: string; document: PolicyDocument }>> = {
   AdministratorAccess: {

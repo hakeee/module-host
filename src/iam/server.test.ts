@@ -37,6 +37,8 @@ const notes = defineServerModule({
   },
 });
 
+const accountCalls: string[] = [];
+
 function setup() {
   sessions.clear();
   const sqlite = new Database(":memory:");
@@ -49,6 +51,19 @@ function setup() {
       if (sqlite.prepare("SELECT 1 FROM user WHERE email = ?").get(input.email)) return { error: "email-taken" as const };
       const r = sqlite.prepare("INSERT INTO user (email, display_name) VALUES (?, ?)").run(input.email, input.displayName);
       return { id: Number(r.lastInsertRowid) };
+    },
+    async disable(userId: number) {
+      accountCalls.push(`disable ${userId}`);
+    },
+    async enable(userId: number) {
+      accountCalls.push(`enable ${userId}`);
+    },
+    async revokeSessions(userId: number) {
+      accountCalls.push(`revoke ${userId}`);
+    },
+    async resetPassword(userId: number) {
+      accountCalls.push(`reset ${userId}`);
+      return userId === 99 ? ({ error: "no-local-login" } as const) : ({ ok: true } as const);
     },
   };
   const iam = createIam({ accounts, defaultRoles: ["member"], oidc: { roleMap: { "app-admin": "admin" } } });
@@ -75,6 +90,7 @@ function setup() {
       return { userId, sessionId: `s${userId}` };
     },
     authorize: iam.authorize,
+    extraActions: [{ action: "vault:setRecoveryKey", kind: "self-service" }],
   });
   host.migrate();
   const addUser = (email: string) => Number(sqlite.prepare("INSERT INTO user (email, display_name) VALUES (?, ?)").run(email, email).lastInsertRowid);
@@ -110,7 +126,7 @@ describe("IAM", () => {
     sessions.delete(`s${other}`);
     const access = await rpc("iam/rpc/myAccess", other);
     expect(access.statusCode).toBe(200);
-    expect(access.json()).toEqual({ userId: other, root: false, statements: [] });
+    expect(access.json()).toEqual({ userId: other, root: false, statements: [], selfService: [{ action: "vault:setRecoveryKey", allowed: true }] });
   });
 
   it("seeds admin and member; member reads but can't write, from the browser or in-process", async () => {
@@ -197,11 +213,57 @@ describe("IAM", () => {
     expect(row).toMatchObject({ status: "queued", error: "OperationError" }); // retried later; fails for good if still denied
   });
 
+  it("runs admin actions on other accounts, but never on root, and doesn't let you disable yourself", async () => {
+    accountCalls.length = 0;
+    const root = env.addUser("root@example.com");
+    const admin = env.addUser("a@example.com");
+    const member = env.addUser("m@example.com");
+    const iam = env.host.client(iamContract);
+    await iam.commands.setUserRoles(unlock(root), { userId: admin, roles: ["admin"] });
+    const asAdmin = unlock(admin);
+
+    await iam.commands.disableUser(asAdmin, { userId: member });
+    await iam.commands.enableUser(asAdmin, { userId: member });
+    await iam.commands.revokeSessions(asAdmin, { userId: member });
+    await iam.commands.resetPassword(asAdmin, { userId: member, password: "temporary1" });
+    expect(accountCalls).toEqual([`disable ${member}`, `enable ${member}`, `revoke ${member}`, `reset ${member}`]);
+
+    await expect(iam.commands.disableUser(asAdmin, { userId: root })).rejects.toMatchObject({ status: 400 });
+    await expect(iam.commands.resetPassword(asAdmin, { userId: root, password: "temporary1" })).rejects.toMatchObject({ status: 400 });
+    await expect(iam.commands.disableUser(asAdmin, { userId: admin })).rejects.toMatchObject({ status: 400 });
+    await expect(iam.commands.resetPassword(asAdmin, { userId: 99, password: "temporary1" })).rejects.toMatchObject({ status: 400 });
+    expect(await iam.queries.settings(asAdmin, {})).toEqual({ canCreateUsers: true, canDisableUsers: true, canResetPasswords: true, canRevokeSessions: true });
+    // A member can't do any of it.
+    await expect(iam.commands.revokeSessions(unlock(member), { userId: admin })).rejects.toMatchObject({ status: 403 });
+  });
+
+  it("allows self-service actions unless a policy explicitly denies them", async () => {
+    const root = env.addUser("root@example.com");
+    const user = env.addUser("u@example.com");
+    const asRoot = unlock(root);
+    const iam = env.host.client(iamContract);
+    // No roles at all, and still allowed: managing your own security is the default.
+    expect(env.iam.authorize({ userId: user, sessionId: "x" }, "vault:setRecoveryKey")).toBe(true);
+    expect((await iam.queries.myAccess(unlock(user), {})).selfService).toEqual([{ action: "vault:setRecoveryKey", allowed: true }]);
+
+    await iam.commands.putPolicy(asRoot, {
+      name: "NoRecoveryKeys",
+      description: "",
+      document: { version: 1, statements: [{ effect: "deny", actions: ["vault:setRecoveryKey"] }] },
+    });
+    await iam.commands.putRole(asRoot, { name: "locked-down", description: "", policies: ["NoRecoveryKeys"] });
+    await iam.commands.setUserRoles(asRoot, { userId: user, roles: ["locked-down"] });
+    expect(env.iam.authorize({ userId: user, sessionId: "x" }, "vault:setRecoveryKey")).toBe(false);
+    expect((await iam.queries.myAccess(unlock(user), {})).selfService).toEqual([{ action: "vault:setRecoveryKey", allowed: false }]);
+    expect(env.iam.authorize({ userId: root, sessionId: "x" }, "vault:setRecoveryKey")).toBe(true);
+  });
+
   it("lists every installed action, jobs included", () => {
     const actions = env.host.actions().map((a) => `${a.action}=${a.kind}`);
     expect(actions).toContain("notes:list=query");
     expect(actions).toContain("notes:create=command");
     expect(actions).toContain("notes:reindex=job");
     expect(actions).toContain("iam:putPolicy=command");
+    expect(actions).toContain("vault:setRecoveryKey=self-service");
   });
 });

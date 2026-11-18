@@ -24,7 +24,13 @@ export function IamAccess({ children }: { children: ReactNode }) {
   }, [host]);
   const data = me.data;
   const can = useCallback(
-    (action: string) => data !== undefined && (data.root || evaluate(data.statements, action, (a) => kinds.get(a))),
+    (action: string) => {
+      if (data === undefined) return false;
+      if (data.root) return true;
+      // Self-service actions aren't in any contract; the server says which are denied.
+      const selfService = data.selfService.find((s) => s.action === action);
+      return selfService ? selfService.allowed : evaluate(data.statements, action, (a) => kinds.get(a));
+    },
     [data, kinds],
   );
   return (

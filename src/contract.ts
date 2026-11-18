@@ -300,7 +300,13 @@ export function actionOf(op: { readonly contractId: string; readonly name: strin
   return `${op.contractId}:${op.name}`;
 }
 
-export type ActionKind = "query" | "command" | "job" | "declared";
+/**
+ * `self-service` is for actions outside modules that people take on their
+ * own account (e.g. vault-service's `vault:setRecoveryKey`): allowed unless
+ * a policy explicitly denies them, since denying by default would stop
+ * everyone managing their own security.
+ */
+export type ActionKind = "query" | "command" | "job" | "declared" | "self-service";
 
 /** One action an installed module can be authorized for. */
 export interface ActionInfo {

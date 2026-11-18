@@ -3,13 +3,14 @@ import { OperationError, type ActionKind } from "../contract.js";
 import type { Caller } from "../client.js";
 import { defineServerModule } from "../server/index.js";
 import { iamContract } from "./contract.js";
-import { MANAGED_POLICIES, STARTER_ROLES, evaluate, type PolicyDocument, type PolicyStatement } from "./policy.js";
+import { MANAGED_POLICIES, STARTER_ROLES, evaluate, isDenied, type PolicyDocument, type PolicyStatement } from "./policy.js";
 import { iamPolicy, iamRole, iamRolePolicy, iamRoot, iamUserRole } from "./schema.js";
 
 export interface IamAccount {
   id: number;
   email: string;
   displayName: string;
+  disabled?: boolean;
 }
 
 /**
@@ -20,6 +21,10 @@ export interface IamAccount {
 export interface IamAccounts {
   list(): IamAccount[] | Promise<IamAccount[]>;
   create?(input: { email: string; password: string; displayName: string }): Promise<{ id: number } | { error: "email-taken" }>;
+  disable?(userId: number): Promise<void>;
+  enable?(userId: number): Promise<void>;
+  revokeSessions?(userId: number): Promise<void>;
+  resetPassword?(userId: number, password: string): Promise<{ ok: true } | { error: "no-local-login" }>;
 }
 
 /** What vault-service's `onLogin` hands over (see `createAuthRoutes`). */
@@ -147,6 +152,25 @@ export function createIam(options: IamOptions) {
     return statements;
   };
 
+  const selfServiceActions = () => listActions().filter((a) => a.kind === "self-service").map((a) => a.action);
+  const allowedFor = (userId: number, action: string): boolean => {
+    if (ALWAYS_ALLOWED.has(action)) return true;
+    seed();
+    if (userId === root()) return true;
+    if (kindOf(action) === "self-service") return !isDenied(statementsFor(userId), action, kindOf);
+    return evaluate(statementsFor(userId), action, kindOf);
+  };
+  /** Admin actions on someone else's account: never root, and (for disabling) not yourself. */
+  const assertTarget = (callerId: number, userId: number, what: string, notSelf = false) => {
+    if (userId === root()) throw new OperationError(400, `root can't be ${what}`);
+    if (notSelf && userId === callerId) throw new OperationError(400, `you can't ${what.replace(/d$/, "")} yourself`);
+  };
+  const need = <K extends "disable" | "enable" | "revokeSessions" | "resetPassword">(key: K) => {
+    const fn = options.accounts[key];
+    if (!fn) throw new OperationError(400, "not supported for these accounts");
+    return fn.bind(options.accounts) as NonNullable<IamAccounts[K]>;
+  };
+
   const roleNames = () => new Set((db().prepare("SELECT name FROM iam_role").all() as { name: string }[]).map((r) => r.name));
   const assertRolesExist = (roles: readonly string[]) => {
     const known = roleNames();
@@ -175,7 +199,12 @@ export function createIam(options: IamOptions) {
         queries: {
           myAccess: (call) => {
             seed();
-            return { userId: call.userId, root: call.userId === root(), statements: statementsFor(call.userId) };
+            return {
+              userId: call.userId,
+              root: call.userId === root(),
+              statements: statementsFor(call.userId),
+              selfService: selfServiceActions().map((action) => ({ action, allowed: allowedFor(call.userId, action) })),
+            };
           },
           users: async () => {
             seed();
@@ -187,7 +216,10 @@ export function createIam(options: IamOptions) {
             }[];
             const accounts = await options.accounts.list();
             return accounts.map((a) => ({
-              ...a,
+              id: a.id,
+              email: a.email,
+              displayName: a.displayName,
+              disabled: a.disabled ?? false,
               root: a.id === rootUser,
               roles: rows.filter((r) => r.userId === a.id).map((r) => ({ name: r.role, source: r.source })),
             }));
@@ -212,7 +244,12 @@ export function createIam(options: IamOptions) {
             ).map((p) => ({ name: p.name, description: p.description, managed: p.managed === 1, document: JSON.parse(p.document) }));
           },
           actions: () => [...ctx.actions()].sort((a, b) => a.action.localeCompare(b.action)),
-          settings: () => ({ canCreateUsers: options.accounts.create !== undefined }),
+          settings: () => ({
+            canCreateUsers: options.accounts.create !== undefined,
+            canDisableUsers: options.accounts.disable !== undefined && options.accounts.enable !== undefined,
+            canResetPasswords: options.accounts.resetPassword !== undefined,
+            canRevokeSessions: options.accounts.revokeSessions !== undefined,
+          }),
         },
         commands: {
           createUser: async (_call, input) => {
@@ -227,6 +264,26 @@ export function createIam(options: IamOptions) {
             if ("error" in result) throw new OperationError(409, "an account with that email already exists");
             replaceRoles(result.id, "manual", input.roles);
             return { id: result.id };
+          },
+          disableUser: async (call, { userId }) => {
+            assertTarget(call.userId, userId, "disabled", true);
+            await need("disable")(userId);
+            return {};
+          },
+          enableUser: async (_call, { userId }) => {
+            await need("enable")(userId);
+            return {};
+          },
+          revokeSessions: async (call, { userId }) => {
+            assertTarget(call.userId, userId, "logged out by someone else");
+            await need("revokeSessions")(userId);
+            return {};
+          },
+          resetPassword: async (call, { userId, password }) => {
+            assertTarget(call.userId, userId, "reset by someone else");
+            const result = await need("resetPassword")(userId, password);
+            if ("error" in result) throw new OperationError(400, "this account has no password login (it signs in through the identity provider)");
+            return {};
           },
           setUserRoles: (_call, { userId, roles }) => {
             seed();
@@ -290,12 +347,12 @@ export function createIam(options: IamOptions) {
   return {
     module,
 
-    /** For the host's `authorize`. */
+    /**
+     * For the host's `authorize`, and vault-service's (its self-service
+     * actions are allowed unless a policy explicitly denies them).
+     */
     authorize(caller: Caller, action: string): boolean {
-      if (ALWAYS_ALLOWED.has(action)) return true;
-      seed();
-      if (caller.userId === root()) return true;
-      return evaluate(statementsFor(caller.userId), action, kindOf);
+      return allowedFor(caller.userId, action);
     },
 
     /** For vault-service's `onLogin`: OIDC role mapping, and default roles for new signups. */
