@@ -34,6 +34,12 @@ export function runsLocked(op: Pick<OperationDef, "vault">): boolean {
 export interface PageDef {
   readonly path: `/${string}`;
   readonly params: Schema;
+  /**
+   * The action needed to see this page (`"users"` for this contract's own,
+   * or a full `"module:action"`). Denied pages render the outlet's
+   * `forbidden` and drop out of the nav. Default: no check.
+   */
+  readonly action?: string;
 }
 
 /**
@@ -106,6 +112,12 @@ export interface ContractDef {
   readonly slots?: Readonly<Record<string, SlotDef<any>>>;
   readonly components?: Readonly<Record<string, ComponentDef<any>>>;
   readonly entities?: Readonly<Record<string, EntityDef>>;
+  /**
+   * Extra actions this module checks itself (custom routes, page access),
+   * beyond the ones every operation and job already is. Local names; the
+   * full action is `<id>:<name>`.
+   */
+  readonly actions?: readonly string[];
 }
 
 /** `T` itself when it fits `Bound` - unlike `T & Bound`, which would merge in Bound's `any`s and erase inference. */
@@ -191,6 +203,8 @@ export type Contract<C extends ContractDef = ContractDef> = {
     >;
   };
   readonly entities: { readonly [K in keyof Section<C, "entities"> & string]: EntityRef<C["id"], K> };
+  /** Declared extra actions, as full `module:action` strings. */
+  readonly actions: readonly string[];
 };
 
 export type AnyContract = Contract<ContractDef>;
@@ -238,7 +252,7 @@ export function defineContract<const C extends ContractDef>(def: C & EntityConst
   }
   const pages = refs(def.pages, (name, page) => {
     if (!page.path.startsWith("/")) throw new Error(`contract "${def.id}": page "${name}" path must start with /`);
-    return { ...page, contractId: def.id, name };
+    return { ...page, contractId: def.id, name, action: page.action === undefined ? undefined : fullAction(def.id, page.action) };
   });
 
   const entities = refs(def.entities, (name, entity) => {
@@ -269,7 +283,38 @@ export function defineContract<const C extends ContractDef>(def: C & EntityConst
     slots: refs(def.slots, (name, s) => ({ ...s, contractId: def.id, name })),
     components: refs(def.components, (name, c) => ({ ...c, contractId: def.id, name })),
     entities,
+    actions: (def.actions ?? []).map((name) => fullAction(def.id, name)),
   } as unknown as Contract<C>;
+}
+
+/**
+ * Authorization is by action: `module:operation` for every query and
+ * command, `module:job` for jobs, plus a contract's declared `actions`.
+ * A local name gets the contract id prefixed; a full one is kept.
+ */
+export function fullAction(contractId: string, action: string): string {
+  return action.includes(":") ? action : `${contractId}:${action}`;
+}
+
+export function actionOf(op: { readonly contractId: string; readonly name: string }): string {
+  return `${op.contractId}:${op.name}`;
+}
+
+export type ActionKind = "query" | "command" | "job" | "declared";
+
+/** One action an installed module can be authorized for. */
+export interface ActionInfo {
+  readonly action: string;
+  readonly kind: ActionKind;
+}
+
+/** Every action a contract defines (operations and declared ones; jobs are server-side only). */
+export function actionsOf(contract: AnyContract): ActionInfo[] {
+  return [
+    ...Object.values(contract.queries as Record<string, OperationRef>).map((op) => ({ action: actionOf(op), kind: "query" as const })),
+    ...Object.values(contract.commands as Record<string, OperationRef>).map((op) => ({ action: actionOf(op), kind: "command" as const })),
+    ...(contract.actions ?? []).map((action) => ({ action, kind: "declared" as const })),
+  ];
 }
 
 /**

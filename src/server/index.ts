@@ -6,8 +6,11 @@ import {
   OperationError,
   assertModuleId,
   isContract,
+  actionOf,
+  actionsOf,
   operationsOf,
   runsLocked,
+  type ActionInfo,
   type AnyContract,
   type OperationDef,
   type OperationRef,
@@ -163,6 +166,10 @@ export interface ServerContext<
   ): void;
   /** Adds Fastify routes under `/<prefix>/<module id>`. Prefer contract operations; use this for what doesn't fit (uploads, streaming). */
   routes(plugin: (app: FastifyInstance) => Promise<void> | void): void;
+  /** Whether `caller` may perform `action` (always true without the host's `authorize`). For custom routes and declared actions. */
+  can(caller: Caller, action: string): Promise<boolean>;
+  /** Every action the installed modules define - e.g. for a policy editor. */
+  actions(): readonly ActionInfo[];
   /** For your own routes: this module's call context, or a 423 reply and undefined. */
   requireCall(request: FastifyRequest, reply: FastifyReply): CallContextFor<L> | undefined;
   /** This module's call context for a caller, e.g. a session id stored with a job. */
@@ -268,6 +275,15 @@ export interface ServerHostOptions {
    * without it, the socket's heartbeat notices (every `live.heartbeatMs`).
    */
   vaultEvents?(listener: (change: VaultChange) => void): () => void;
+  /**
+   * Authorization for every operation call - from the browser, from another
+   * module in-process, over the internal channel - and every job run, as
+   * the calling user. `action` is `module:operation` (or `module:job`).
+   * A denied call fails with `OperationError(403)`. Without it, everything
+   * is allowed. The built-in IAM module (`@hakeee/module-host/iam/server`)
+   * provides one.
+   */
+  authorize?(caller: Caller, action: string): boolean | Promise<boolean>;
   /** Tables outside any module that modules may reference, e.g. `["user"]`. */
   sharedTables?: readonly string[];
   logError?: (error: unknown, message: string) => void;
@@ -333,6 +349,8 @@ export interface ServerHost {
   client<C extends AnyContract>(contract: C): Client<C>;
   /** Runs this host's modules' background jobs (only theirs - a worker process can host a subset). */
   readonly jobs: JobRunner;
+  /** Every action the installed modules define. */
+  actions(): readonly ActionInfo[];
   /** Open live-update sockets (for tests and diagnostics). */
   liveConnectionCount(): number;
   /** The internal channel (needs `internal.secret`): mount at a private prefix, outside your cookie-auth routes. */
@@ -448,8 +466,14 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
   const callForOp = (runtime: Runtime, op: OperationRef, caller: Caller): CallContext =>
     runsLocked(op) ? ({ userId: caller.userId, sessionId: caller.sessionId } as CallContext) : callFor(runtime, caller);
 
+  const can = async (caller: Caller, action: string) => (options.authorize ? await options.authorize(caller, action) : true);
+  const assertAllowed = async (caller: Caller, action: string) => {
+    if (!(await can(caller, action))) throw new OperationError(403, `not allowed: ${action}`);
+  };
+
   const invoke = async (provider: Runtime, op: OperationRef, call: CallContext, rawInput: unknown) => {
     const where = `${op.contractId}.${op.name}`;
+    await assertAllowed(call, actionOf(op));
     let input: unknown;
     try {
       input = await validate(op.input, rawInput, `${where} input`);
@@ -535,6 +559,11 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
     }
   }
 
+  const allActions: ActionInfo[] = modules.flatMap((m) => [
+    ...(m.contract ? actionsOf(m.contract) : []),
+    ...Object.keys(m.def.jobs ?? {}).map((name) => ({ action: `${m.id}:${name}`, kind: "job" as const })),
+  ]);
+
   for (const module of modules) {
     const runtime: Runtime = { module, visible: visibleContracts(module), routePlugins: [], handlers: {}, jobHandlers: {} };
     runtimes.set(module.id, runtime);
@@ -568,6 +597,8 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
       routes(plugin) {
         runtime.routePlugins.push(plugin);
       },
+      can,
+      actions: () => allActions,
       requireCall(request, reply) {
         const unlocked = options.requireVault(request, reply);
         return unlocked ? (buildCall(runtime, unlocked, unlocked.vault) as never) : undefined;
@@ -635,6 +666,7 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
       return;
     }
     try {
+      await assertAllowed(caller, `${row.module}:${row.name}`); // re-checked at run time: access may have been revoked since
       const handler = runtime.jobHandlers[row.name];
       if (!handler) throw new ModuleCompositionError(`no handler for job "${row.name}"`);
       const schema = (runtime.module.def.jobs ?? {})[row.name]!;
@@ -738,6 +770,7 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
       migrateResolved(options.db, modules);
     },
     jobs: jobRunner,
+    actions: () => allActions,
     liveConnectionCount: () => live?.connectionCount() ?? 0,
     async routes(app) {
       if (live) {

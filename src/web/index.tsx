@@ -24,6 +24,7 @@ import {
 } from "react";
 import {
   assertModuleId,
+  actionOf,
   isContract,
   operationsOf,
   runsLocked,
@@ -282,9 +283,10 @@ function buildContractHooks(contract: AnyContract, host: WebHost, queryClient: Q
         {
           // biome-ignore lint: forwarded straight to react-query
           useQuery: (input: unknown, options?: any) => {
-            // Paused while locked instead of failing with 423; resumes on unlock.
+            // Paused while locked (instead of failing with 423) or not allowed (403); resumes when that changes.
             const unlocked = useVaultUnlocked();
-            const enabled = runsLocked(op) || unlocked ? (options?.enabled ?? true) : false;
+            const allowed = useCan(actionOf(op));
+            const enabled = (runsLocked(op) || unlocked) && allowed ? (options?.enabled ?? true) : false;
             return useQuery({ ...options, enabled, queryKey: keyOf(input ?? {}), queryFn: () => fetch(input) });
           },
           fetch,
@@ -607,6 +609,11 @@ function needsVault(host: WebHost, key: QueryKey): boolean {
   return op !== undefined && !runsLocked(op);
 }
 
+/** The web host from `<ModuleHostProvider>` - for code that needs the installed contracts or routes. */
+export function useWebHost(): WebHost {
+  return useHostContext().host;
+}
+
 /** Whether the vault is unlocked, as the app told `<ModuleHostProvider unlocked>`. */
 export function useVaultUnlocked(): boolean {
   return useHostContext().unlocked;
@@ -677,9 +684,14 @@ export function Link<P extends PageRef>(props: LinkProps<P>) {
   );
 }
 
-/** Renders the page for the current location. `/` falls back to `home`; anything else unmatched renders `notFound`. */
-export function RouterOutlet({ notFound = null }: { notFound?: ReactNode }) {
+/**
+ * Renders the page for the current location. `/` falls back to `home`;
+ * anything else unmatched renders `notFound`, and a page whose `action`
+ * is denied renders `forbidden` (default: `notFound`).
+ */
+export function RouterOutlet({ notFound = null, forbidden }: { notFound?: ReactNode; forbidden?: ReactNode }) {
   const { host, location } = useHostContext();
+  const access = useContext(AccessContext);
   const route = useRoute();
   if (!route) {
     const pathname = location.split("?")[0];
@@ -688,6 +700,10 @@ export function RouterOutlet({ notFound = null }: { notFound?: ReactNode }) {
       return null;
     }
     return <>{notFound}</>;
+  }
+  if (route.page.action !== undefined) {
+    if (!access.ready) return null;
+    if (!access.can(route.page.action)) return <>{forbidden ?? notFound}</>;
   }
   const PageComponent = host.componentFor(route.page)!;
   return (
@@ -701,11 +717,46 @@ export interface NavEntry extends ResolvedNavItem {
   readonly active: boolean;
 }
 
+/** Nav entries the user may see: items whose page has an `action` they're denied drop out. */
 export function useNav(): readonly NavEntry[] {
   const { host } = useHostContext();
+  const access = useContext(AccessContext);
   const route = useRoute();
   const isRoute = (page: PageRef) => route !== undefined && route.page.contractId === page.contractId && route.page.name === page.name;
-  return host.nav.map((item) => ({ ...item, active: isRoute(item.page) || item.activeOn.some(isRoute) }));
+  return host.nav
+    .filter((item) => item.page.action === undefined || (access.ready && access.can(item.page.action)))
+    .map((item) => ({ ...item, active: isRoute(item.page) || item.activeOn.some(isRoute) }));
+}
+
+// --- access ---------------------------------------------------------------------------
+
+interface AccessValue {
+  can(action: string): boolean;
+  /** False while permissions are loading: gated UI renders nothing rather than flashing "forbidden". */
+  ready: boolean;
+}
+
+const AccessContext = createContext<AccessValue>({ can: () => true, ready: true });
+
+/**
+ * What the user may do, for hiding UI - the server enforces it regardless
+ * (see the host's `authorize`). Without a provider everything is allowed.
+ * The built-in IAM module's `<IamAccess>` provides one.
+ */
+export function AccessProvider({ can, ready = true, children }: { can: (action: string) => boolean; ready?: boolean; children: ReactNode }) {
+  const value = useMemo(() => ({ can, ready }), [can, ready]);
+  return <AccessContext.Provider value={value}>{children}</AccessContext.Provider>;
+}
+
+/** Whether the user may perform `action` (`module:action`). False while permissions load. */
+export function useCan(action: string): boolean {
+  const access = useContext(AccessContext);
+  return access.ready && access.can(action);
+}
+
+/** Renders `children` only when `action` is allowed, else `fallback`. */
+export function IfCan({ action, children, fallback = null }: { action: string; children: ReactNode; fallback?: ReactNode }) {
+  return <>{useCan(action) ? children : fallback}</>;
 }
 
 const noBadge = () => undefined;

@@ -364,6 +364,53 @@ app.register(api.internalRoutes, { prefix: "/internal/m" });   // receives relay
 - **Not yet:** events from one process reaching *subscriber modules* in
   another. Only the live push to browsers is relayed.
 
+## Authorization and IAM
+
+Every operation is an **action**: `module:operation` (`notes:list`,
+`notes:create`). Jobs are `module:job`, and a contract can declare extra
+`actions` for custom routes or pages. `host.actions()` lists them all.
+
+- **Enforcement is in the host.** With the `authorize(caller, action)` host
+  option, every operation call is checked as the calling user: from the
+  browser, in-process from another module, and over the internal channel.
+  Every job run is checked too, at run time, so revoking access stops queued
+  work. A denied call is an `OperationError(403)`. Without the option,
+  everything is allowed (Ebba). Worker processes need the same `authorize`.
+  - Strict means transitive: if a page's module calls `people.labels` for
+    you, you need `people:labels` too. Wildcards make this manageable.
+- **Browser:** `<AccessProvider can ready>` feeds `useCan(action)`,
+  `<IfCan>`, the nav (items whose page has a denied `action` drop out) and
+  `<RouterOutlet forbidden>`. Denied queries pause instead of failing. This
+  is UX only; the server decides.
+- **Built-in IAM** (`@hakeee/module-host/iam`, `/iam/server`, `/iam/web`)
+  is an optional module, modeled on AWS IAM:
+  - Users get roles, roles get policies. A policy is
+    `{ version: 1, statements: [{ effect, actions, notActions?, kind?, resources? }] }`.
+    Wildcards work anywhere and matching is case-insensitive. An explicit
+    deny beats any allow, and anything not allowed is denied.
+  - `kind: "query" | "command"` narrows a statement to reads or writes.
+    `resources` is reserved: only `"*"` applies today.
+  - Managed policies: AdministratorAccess (`*`) and ReadOnlyAccess (every
+    query except IAM's). Starter roles `admin` and `member` are created on a
+    fresh install and are ordinary data afterwards.
+  - Root is the first account (or `rootEmail`) and is always allowed
+    everything. `iam:myAccess` is always allowed.
+  - IAM's tables are plain data (checked while locked, edited by admins for
+    others). Its reads are `vault: false`; its changes need an unlocked vault,
+    so a stolen cookie can't grant itself access.
+  - `createIam({ accounts, rootEmail?, defaultRoles?, oidc? })` returns
+    `{ module, authorize, onLogin }`. `accounts` is vault-service's
+    `createAccountStore(db)`, minus `create` for OIDC.
+  - `onLogin` (from vault-service's `createAuthRoutes`) maps IdP roles to
+    IAM roles at each login (`oidc.roleMap`; the Zitadel roles claim by
+    default) and gives signups `defaultRoles`.
+  - The web part is headless (`<IamAccess>`, `useRefreshAccess`). Apps build
+    the admin pages for `iamContract.pages` themselves, like they build
+    their auth screens.
+  - Permissions decide what someone may *do*. They can't open another
+    user's vault: encrypted data stays readable only by its owner, root
+    included.
+
 ## Rules that aren't enforced by types (yet)
 
 - Don't import another module's `server`/`web` internals. Package

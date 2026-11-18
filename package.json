@@ -22,10 +22,26 @@
       "types": "./src/web/index.tsx",
       "development": "./src/web/index.tsx",
       "default": "./dist/web/index.js"
+    },
+    "./iam": {
+      "types": "./src/iam/index.ts",
+      "development": "./src/iam/index.ts",
+      "default": "./dist/iam/index.js"
+    },
+    "./iam/server": {
+      "types": "./src/iam/server.ts",
+      "development": "./src/iam/server.ts",
+      "default": "./dist/iam/server.js"
+    },
+    "./iam/web": {
+      "types": "./src/iam/web.tsx",
+      "development": "./src/iam/web.tsx",
+      "default": "./dist/iam/web.js"
     }
   },
   "files": [
     "dist",
+    "migrations",
     "src",
     "!src/**/*.test.ts",
     "!src/**/*.test.tsx"
@@ -41,7 +57,8 @@
     "@tanstack/react-query": "^5.0.0",
     "drizzle-orm": "^0.45.0",
     "fastify": "^5.5.0",
-    "react": "^19.0.0"
+    "react": "^19.0.0",
+    "zod": "^4.0.0"
   },
   "peerDependenciesMeta": {
     "@tanstack/react-query": {
@@ -60,6 +77,9 @@
       "optional": true
     },
     "@fastify/websocket": {
+      "optional": true
+    },
+    "zod": {
       "optional": true
     }
   },
