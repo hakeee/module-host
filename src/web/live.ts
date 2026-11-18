@@ -11,6 +11,8 @@ export interface LiveConnectOptions {
   invalidate(contractId: string, query?: string): void;
   /** After a reconnect: events may have been missed, so refetch everything live-capable. */
   onReconnect(contractIds: readonly string[]): void;
+  /** The server reported this tab's vault locked or unlocked (on connect, and on every change). */
+  onVault?(unlocked: boolean): void;
 }
 
 export interface LiveClient {
@@ -35,6 +37,7 @@ export function createLiveClient(config: {
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
   let failures = 0;
   let everOpened = false;
+  let vaultUnlocked: boolean | undefined;
 
   const setStatus = (next: LiveStatus) => {
     status = next;
@@ -51,6 +54,14 @@ export function createLiveClient(config: {
     try {
       message = JSON.parse(raw);
     } catch {
+      return;
+    }
+    if (message.type === "vault" && typeof (message as { unlocked?: unknown }).unlocked === "boolean") {
+      const unlocked = (message as { unlocked: boolean }).unlocked;
+      // Events aren't delivered while locked, so anything live may be stale.
+      if (unlocked && vaultUnlocked === false) current?.onReconnect(liveContractIds());
+      vaultUnlocked = unlocked;
+      current?.onVault?.(unlocked);
       return;
     }
     if (message.type === "jobs" && typeof (message as { module?: unknown }).module === "string") {
@@ -110,6 +121,7 @@ export function createLiveClient(config: {
         socket = undefined;
         ws?.close(1000, "done");
         everOpened = false;
+        vaultUnlocked = undefined;
         failures = 0;
         setStatus("idle");
       };

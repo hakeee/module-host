@@ -15,6 +15,19 @@ export interface OperationDef {
    * something any logged-in tab can drive directly.
    */
   readonly serverOnly?: boolean;
+  /**
+   * `false`: runs for a logged-in caller whose vault is locked. The handler
+   * gets the caller but no vault scope, so it can't decrypt anything, and
+   * whatever it returns is readable by anyone holding the login cookie -
+   * use it for plain data (an email, a count, a setting). Default: needs an
+   * unlocked vault (423 otherwise).
+   */
+  readonly vault?: boolean;
+}
+
+/** True when an operation runs without an unlocked vault (`vault: false`). */
+export function runsLocked(op: Pick<OperationDef, "vault">): boolean {
+  return op.vault === false;
 }
 
 /** A routable page. `params` parses the path's `:name` segments (strings) into typed values. */
@@ -107,6 +120,8 @@ export interface OperationRef<Id extends string = string, Name extends string = 
   readonly name: Name;
   readonly input: Def["input"];
   readonly output: Def["output"];
+  /** Literal `false` when the contract says so, so handler types can tell. */
+  readonly vault: Def extends { readonly vault: false } ? false : boolean | undefined;
 }
 
 export interface EventRef<Id extends string = string, Name extends string = string, S extends Schema = Schema> {

@@ -6,9 +6,18 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 export type LiveMessage =
   | { readonly type: "event"; readonly contract: string; readonly event: string; readonly payload: unknown }
   /** A module's job list changed for this user - refetch `useJobs`. No job details travel. */
-  | { readonly type: "jobs"; readonly module: string };
+  | { readonly type: "jobs"; readonly module: string }
+  /** This tab's vault session locked or unlocked. Sent on connect and on every change. */
+  | { readonly type: "vault"; readonly unlocked: boolean };
 
-/** Close code sent when a socket's vault session is gone; the client should wait for an unlock, not hammer reconnects. */
+/** A session's vault became unlocked or stopped being - e.g. from vault-service's `sessionCache.onChange`. */
+export interface VaultChange {
+  readonly sessionId: string;
+  readonly userId: number;
+  readonly unlocked: boolean;
+}
+
+/** Close code for a socket that was admitted without a session; the client waits before retrying. */
 export const LIVE_CLOSE_VAULT_LOCKED = 4423;
 
 interface LiveSocket {
@@ -24,38 +33,59 @@ interface Who {
   readonly sessionId: string;
 }
 
+interface Entry {
+  readonly who: Who;
+  unlocked: boolean;
+}
+
 const OPEN = 1;
 
 /**
- * One WebSocket per open tab, keyed to the user and vault session that
- * opened it. Live events go only to that user's sockets, and only while
- * the session's vault is still unlocked: a tab whose session locked gets
- * closed with `LIVE_CLOSE_VAULT_LOCKED` instead of receiving plaintext.
+ * One WebSocket per open tab, keyed to the user and session that opened
+ * it. A socket can open while the vault is locked (when the host has
+ * `requireCaller`); it then gets `{ type: "vault", unlocked }` on connect
+ * and on every change, and module events and job updates only while
+ * unlocked - they can carry decrypted content.
  */
 export function createLiveHub(options: {
   vaultFor(sessionId: string): VaultHandle | undefined;
   heartbeatMs?: number;
   origins?: readonly string[];
 }) {
-  const sockets = new Map<LiveSocket, Who>();
+  const sockets = new Map<LiveSocket, Entry>();
   const pending = new WeakMap<FastifyRequest, Who>();
 
-  const stillUnlocked = (who: Who) => {
+  const isUnlocked = (who: Who) => {
     const vault = options.vaultFor(who.sessionId);
     return vault !== undefined && vault.userId === who.userId;
   };
 
+  const send = (socket: LiveSocket, message: LiveMessage) => {
+    if (socket.readyState === OPEN) socket.send(JSON.stringify(message));
+  };
+
+  /** Brings one socket's known state up to date, telling the tab if it changed. */
+  const sync = (socket: LiveSocket, entry: Entry, unlocked = isUnlocked(entry.who)) => {
+    if (entry.unlocked === unlocked) return;
+    entry.unlocked = unlocked;
+    send(socket, { type: "vault", unlocked });
+  };
+
   return {
     publish(userId: number, message: LiveMessage): void {
-      const data = JSON.stringify(message);
-      for (const [socket, who] of sockets) {
-        if (who.userId !== userId) continue;
-        if (!stillUnlocked(who)) {
-          sockets.delete(socket);
-          socket.close(LIVE_CLOSE_VAULT_LOCKED, "vault locked");
-          continue;
-        }
-        if (socket.readyState === OPEN) socket.send(data);
+      for (const [socket, entry] of sockets) {
+        if (entry.who.userId !== userId) continue;
+        sync(socket, entry);
+        if (entry.unlocked) send(socket, message);
+      }
+    },
+
+    /** A session locked or unlocked: tell its tabs now rather than at the next heartbeat. */
+    vaultChanged(change: VaultChange): void {
+      for (const [socket, entry] of sockets) {
+        if (entry.who.sessionId !== change.sessionId) continue;
+        // Re-check rather than trust the event: the session may belong to another user.
+        sync(socket, entry);
       }
     },
 
@@ -65,20 +95,17 @@ export function createLiveHub(options: {
 
     async register(
       app: FastifyInstance,
-      requireVault: (request: FastifyRequest, reply: FastifyReply) => Who | undefined,
+      /** Who may open a socket: the host's `requireCaller` (logged in), or `requireVault` (unlocked) without one. */
+      admit: (request: FastifyRequest, reply: FastifyReply) => Who | undefined,
     ): Promise<void> {
       // Reuse the app's own registration if it has one (it may need
       // websockets elsewhere, or `injectWS` in tests); otherwise bring it.
       if (!app.hasDecorator("websocketServer")) await app.register(websocket);
 
       const heartbeat = setInterval(() => {
-        for (const [socket, who] of sockets) {
-          if (!stillUnlocked(who)) {
-            sockets.delete(socket);
-            socket.close(LIVE_CLOSE_VAULT_LOCKED, "vault locked");
-          } else if (socket.readyState === OPEN) {
-            socket.ping();
-          }
+        for (const [socket, entry] of sockets) {
+          sync(socket, entry);
+          if (socket.readyState === OPEN) socket.ping();
         }
       }, options.heartbeatMs ?? 30_000);
       heartbeat.unref?.();
@@ -98,9 +125,9 @@ export function createLiveHub(options: {
             if (options.origins && !options.origins.includes(String(request.headers.origin))) {
               return reply.code(403).send({ error: "origin not allowed" });
             }
-            const unlocked = requireVault(request, reply);
-            if (!unlocked) return reply;
-            pending.set(request, { userId: unlocked.userId, sessionId: unlocked.sessionId });
+            const who = admit(request, reply);
+            if (!who) return reply;
+            pending.set(request, { userId: who.userId, sessionId: who.sessionId });
           },
         },
         (socket, request) => {
@@ -109,8 +136,11 @@ export function createLiveHub(options: {
             socket.close(LIVE_CLOSE_VAULT_LOCKED, "vault locked");
             return;
           }
-          sockets.set(socket as unknown as LiveSocket, who);
-          socket.on("close", () => sockets.delete(socket as unknown as LiveSocket));
+          const live = socket as unknown as LiveSocket;
+          const entry: Entry = { who, unlocked: isUnlocked(who) };
+          sockets.set(live, entry);
+          socket.on("close", () => sockets.delete(live));
+          send(live, { type: "vault", unlocked: entry.unlocked });
         },
       );
     },

@@ -124,6 +124,13 @@ export default defineServerModule({
   HTTP it becomes that status.
 - **HTTP:** every operation is served at `POST /<prefix>/<module>/rpc/<op>`,
   behind the app's auth hook. A locked vault gets a 423.
+- **`vault: false`** on an operation lets it run for a logged-in caller
+  whose vault is locked (e.g. the user's email, a count, a setting). Its
+  handler gets only `{ userId, sessionId }`, with no vault scope, so the
+  compiler stops it from decrypting anything. Whatever it returns is
+  readable by anyone holding the login cookie, so it must be plain data.
+  It needs the host option `requireCaller` (vault-service's
+  `createRequireCaller`), and the host refuses to boot without it.
 - **Events** run in-process after `emit` and are awaited. Each subscriber
   gets its own call context. A failing subscriber is logged and doesn't
   fail the emitter.
@@ -188,6 +195,14 @@ export default mod.define({
 - **`<EntityLink>` batches:** label lookups made in the same tick go out as
   one request per entity type, so a timeline of 50 person links is one
   call.
+- **Locked vs unlocked:** by default an app renders modules only once the
+  vault is unlocked. To render them while only logged in, pass the vault
+  state to `<ModuleHostProvider unlocked={...}>`. Then queries that need the
+  vault pause instead of failing with 423, `useVaultUnlocked()` and
+  `<WhenUnlocked fallback={...}>` let a page show locked and unlocked parts,
+  and on lock the cached results of vault queries are cleared, so
+  decrypted data doesn't stay on screen. `createWebHost({ onVaultLocked })`
+  is called on any 423, for re-checking vault state.
 - **`useContractVersionCheck()`** compares the contracts this bundle was
   built against with the server's `/_manifest`. A mismatch usually means a
   stale tab after a deploy, so prompt a reload.
@@ -226,18 +241,26 @@ Events marked `live: true` are pushed over a WebSocket
 (`<prefix>/_live`) to **the emitting user's** open tabs:
 
 - **Server:** on by default (needs `@fastify/websocket`; the host reuses an
-  existing root registration if the app has one). The socket needs an
-  unlocked vault to open. Before each push, the host re-checks that the
-  socket's session is still unlocked, and closes it with code 4423 if not,
-  rather than sending plaintext to a locked tab. Set `live.origins`:
-  browsers send cookies with WebSocket handshakes and CORS doesn't apply.
-- **Browser:** mount `<LiveConnection />` where the vault is unlocked. An
+  existing root registration if the app has one). With `requireCaller` the
+  socket opens once logged in; without it, it needs an unlocked vault.
+  - Each socket gets `{ type: "vault", unlocked }` when it connects and
+    whenever that changes. With `vaultEvents` (vault-service's
+    `sessionCache.onChange`) the change is pushed right away. Otherwise
+    it's noticed at the next push or heartbeat (`live.heartbeatMs`,
+    default 30 s).
+  - Events and job updates go only to unlocked sockets, since they can
+    carry decrypted content. A socket stays open across lock and unlock.
+  - Set `live.origins`: browsers send cookies with WebSocket handshakes and
+    CORS doesn't apply.
+- **Browser:** mount `<LiveConnection onVaultChange={...} />` once logged in
+  (or where the vault is unlocked, without `requireCaller`). `onVaultChange`
+  hears about locks and unlocks, e.g. to re-check vault state. An
   incoming event is validated against the contract, then the queries in
   its `invalidates` are refetched. That alone covers most live UI, with no
   code. For custom reactions use `mod.useLiveEvent(contract, "renamed",
   payload => ...)`, typed and visibility-checked. The client reconnects
-  with backoff, and after a reconnect it refetches every live contract's
-  queries, since events may have been missed. `useLiveStatus()` reports
+  with backoff, and after a reconnect or an unlock it refetches every live
+  contract's queries, since events may have been missed. `useLiveStatus()` reports
   the connection state.
 - Only events are pushed, never query results. A push says "this
   changed"; clients refetch through the normal validated RPC path.

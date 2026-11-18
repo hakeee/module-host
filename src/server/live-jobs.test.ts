@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { defineContract } from "../contract.js";
 import { ModuleCompositionError } from "../resolve.js";
-import { JOBS_TABLE, LIVE_CLOSE_VAULT_LOCKED, createServerHost, defineServerModule, type AnyServerModule, type JobEvent } from "./index.js";
+import { JOBS_TABLE, createServerHost, defineServerModule, type AnyServerModule, type JobEvent } from "./index.js";
 
 // --- vault: sessions by id, via an `x-session` header over HTTP -------------
 
@@ -75,10 +75,22 @@ describe("live updates", () => {
     return { app, host };
   }
 
-  function collect(ws: { on(e: "message", f: (d: Buffer) => void): void }) {
+  /** Messages a socket receives; `vault` state messages separately, so event assertions stay simple. */
+  function collect(ws: { on(e: "message", f: (d: Buffer) => void): void }, vault: unknown[] = []) {
     const got: unknown[] = [];
-    ws.on("message", (data) => got.push(JSON.parse(String(data))));
+    ws.on("message", (data) => {
+      const message = JSON.parse(String(data));
+      (message.type === "vault" ? vault : got).push(message);
+    });
     return got;
+  }
+
+  /** Opens a socket and collects from the very first message (the initial vault state arrives right away). */
+  async function open(app: Awaited<ReturnType<typeof liveApp>>["app"], headers: Record<string, string>) {
+    const vault: unknown[] = [];
+    let got: unknown[] = [];
+    const ws = await app.injectWS("/m/_live", { headers }, { onInit: (socket) => void (got = collect(socket as never, vault)) });
+    return { ws, got: () => got, vault };
   }
 
   it("refuses the socket while the vault is locked", async () => {
@@ -121,21 +133,71 @@ describe("live updates", () => {
     await app.close();
   });
 
-  it("closes a socket whose vault session has since locked, instead of sending to it", async () => {
+  it("keeps a socket open across a lock, holding events back and reporting the state", async () => {
     const { app } = await liveApp();
     const alice = unlock("a1", 1);
-    const ws = await app.injectWS("/m/_live", { headers: { "x-session": "a1" } });
-    const got = collect(ws);
-    const closed = new Promise<number>((resolve) => ws.on("close", (code: number) => resolve(code)));
+    const { ws, got, vault } = await open(app, { "x-session": "a1" });
+    await vi.waitFor(() => expect(vault).toEqual([{ type: "vault", unlocked: true }]));
 
     sessions.delete("a1"); // the session locked
-    await notesCtx!.emit({ ...alice, sessionId: "a2" } as never, "changed", { id: 1 }).catch(() => {});
     unlock("a2", 1); // same user, another (unlocked) session emits
     await notesCtx!.emit({ userId: 1, sessionId: "a2" }, "changed", { id: 1 });
+    await vi.waitFor(() => expect(vault).toHaveLength(2));
+    expect(vault[1]).toEqual({ type: "vault", unlocked: false });
+    expect(got()).toEqual([]);
 
-    expect(await closed).toBe(LIVE_CLOSE_VAULT_LOCKED);
-    expect(got).toEqual([]);
+    unlock("a1", 1);
+    await notesCtx!.emit(alice, "changed", { id: 2 });
+    await vi.waitFor(() => expect(got()).toHaveLength(1));
+    expect(vault[2]).toEqual({ type: "vault", unlocked: true });
+    expect(got()[0]).toMatchObject({ type: "event", payload: { id: 2 } });
+    ws.terminate();
     await app.close();
+  });
+
+  it("with requireCaller, admits a locked tab and reports unlock and lock right away", async () => {
+    const listeners = new Set<(c: { sessionId: string; userId: number; unlocked: boolean }) => void>();
+    const changed = (c: { sessionId: string; userId: number; unlocked: boolean }) => listeners.forEach((l) => l(c));
+    const { host } = build([notes], {
+      live: { heartbeatMs: 60_000 },
+      requireCaller(request, reply) {
+        const sessionId = request.headers["x-session"] as string | undefined;
+        if (!sessionId) {
+          reply.code(401).send({ error: "login required" });
+          return undefined;
+        }
+        return { userId: Number(request.headers["x-user"]), sessionId };
+      },
+      vaultEvents(listener) {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    });
+    const app = Fastify();
+    await app.register(websocket);
+    await app.register(host.routes, { prefix: "/m" });
+    await app.ready();
+
+    await expect(app.injectWS("/m/_live")).rejects.toThrow(/401/);
+    const vault: unknown[] = [];
+    const ws = await app.injectWS("/m/_live", { headers: { "x-session": "c1", "x-user": "1" } }, { onInit: (s) => void collect(s as never, vault) });
+    await vi.waitFor(() => expect(vault).toEqual([{ type: "vault", unlocked: false }]));
+
+    unlock("c1", 1);
+    changed({ sessionId: "c1", userId: 1, unlocked: true });
+    await vi.waitFor(() => expect(vault).toHaveLength(2));
+    sessions.delete("c1");
+    changed({ sessionId: "c1", userId: 1, unlocked: false });
+    changed({ sessionId: "other", userId: 1, unlocked: false }); // another session: not this tab's business
+    await vi.waitFor(() => expect(vault).toHaveLength(3));
+    expect(vault.slice(1)).toEqual([
+      { type: "vault", unlocked: true },
+      { type: "vault", unlocked: false },
+    ]);
+
+    ws.terminate();
+    await app.close();
+    expect(listeners.size).toBe(0); // unsubscribed on close
   });
 });
 

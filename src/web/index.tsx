@@ -1,4 +1,5 @@
 import {
+  QueryClientContext,
   useMutation,
   useQuery,
   useQueryClient,
@@ -25,6 +26,7 @@ import {
   assertModuleId,
   isContract,
   operationsOf,
+  runsLocked,
   type AnyContract,
   type ComponentRef,
   type EntityRef,
@@ -199,10 +201,11 @@ export function webModule<const C extends AnyContract | undefined = undefined, c
     } as WebModuleBuilder<C, R>["Component"],
     useJobs(target: AnyContract) {
       if (!visible.has(target.id)) throw new ModuleCompositionError(`"${id}" reads jobs of "${target.id}" without requiring it`);
-      const { host } = useHostContext();
+      const { host, unlocked } = useHostContext();
       return useQuery({
         queryKey: [target.id, "_jobs"],
         queryFn: () => host.get(`/${target.id}/_jobs`) as Promise<{ jobs: JobSummary[] }>,
+        enabled: unlocked,
       });
     },
     useLiveEvent(target, event, handler) {
@@ -278,7 +281,12 @@ function buildContractHooks(contract: AnyContract, host: WebHost, queryClient: Q
         name,
         {
           // biome-ignore lint: forwarded straight to react-query
-          useQuery: (input: unknown, options?: any) => useQuery({ ...options, queryKey: keyOf(input ?? {}), queryFn: () => fetch(input) }),
+          useQuery: (input: unknown, options?: any) => {
+            // Paused while locked instead of failing with 423; resumes on unlock.
+            const unlocked = useVaultUnlocked();
+            const enabled = runsLocked(op) || unlocked ? (options?.enabled ?? true) : false;
+            return useQuery({ ...options, enabled, queryKey: keyOf(input ?? {}), queryFn: () => fetch(input) });
+          },
           fetch,
           key: keyOf,
           invalidate: (input?: unknown) => queryClient.invalidateQueries({ queryKey: keyOf(input) }),
@@ -321,6 +329,12 @@ export interface WebHostOptions {
   liveUrl?: string;
   /** For tests. */
   WebSocket?: typeof WebSocket;
+  /**
+   * Called when a request comes back 423 (vault locked) - e.g. to re-check
+   * vault state so the app shows its locked UI. The live socket usually
+   * reports a lock first; this catches the rest.
+   */
+  onVaultLocked?: () => void;
 }
 
 interface ResolvedNavItem {
@@ -488,6 +502,15 @@ export function createWebHost(options: WebHostOptions): WebHost {
     throw new ModuleCompositionError(`home page "${pageKey(options.home)}" isn't rendered by any installed module`);
   }
 
+  const parse = async (response: Response) => {
+    if (!response.ok) {
+      if (response.status === 423) options.onVaultLocked?.();
+      const body = (await response.json().catch(() => ({}))) as { error?: string };
+      throw new ModuleRpcError(response.status, body.error ?? response.statusText);
+    }
+    return response.json();
+  };
+
   const hostRpc = async (contractId: string, op: string, input: unknown) => {
     const response = await doFetch(`${options.baseUrl}/${contractId}/rpc/${op}`, {
       method: "POST",
@@ -495,11 +518,7 @@ export function createWebHost(options: WebHostOptions): WebHost {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(input),
     });
-    if (!response.ok) {
-      const body = (await response.json().catch(() => ({}))) as { error?: string };
-      throw new ModuleRpcError(response.status, body.error ?? response.statusText);
-    }
-    return response.json();
+    return parse(response);
   };
 
   return {
@@ -515,12 +534,7 @@ export function createWebHost(options: WebHostOptions): WebHost {
     href: (page, params) => buildHref(page, params as Record<string, unknown> | undefined),
     contracts: knownContracts,
     async get(path) {
-      const response = await doFetch(`${options.baseUrl}${path}`, { credentials: "include" });
-      if (!response.ok) {
-        const body = (await response.json().catch(() => ({}))) as { error?: string };
-        throw new ModuleRpcError(response.status, body.error ?? response.statusText);
-      }
-      return response.json();
+      return parse(await doFetch(`${options.baseUrl}${path}`, { credentials: "include" }));
     },
     label(entity, id) {
       const key = `${entity.contractId}.${entity.labels.name}`;
@@ -550,6 +564,7 @@ export function createWebHost(options: WebHostOptions): WebHost {
 interface HostContextValue {
   host: WebHost;
   location: string;
+  unlocked: boolean;
 }
 
 const HostContext = createContext<HostContextValue | null>(null);
@@ -560,10 +575,50 @@ function useHostContext(): HostContextValue {
   return value;
 }
 
-export function ModuleHostProvider({ host, children }: { host: WebHost; children: ReactNode }) {
+/**
+ * `unlocked` is the app's word on the vault (e.g. from vault-service's
+ * `useVaultGate`). Default `true`, for apps that only render modules once
+ * unlocked. Pass it to render modules while only logged in: queries that
+ * need the vault pause, `<WhenUnlocked>` shows its fallback, and cached
+ * results of those queries are cleared on lock, so decrypted data doesn't
+ * stay on screen or in memory.
+ */
+export function ModuleHostProvider({ host, children, unlocked = true }: { host: WebHost; children: ReactNode; unlocked?: boolean }) {
   const location = useSyncExternalStore(host.history.subscribe, host.history.location, host.history.location);
-  const value = useMemo(() => ({ host, location }), [host, location]);
+  const value = useMemo(() => ({ host, location, unlocked }), [host, location, unlocked]);
+  const queryClient = useContext(QueryClientContext);
+  useEffect(() => {
+    if (unlocked || !queryClient) return;
+    // Reset, not remove: mounted components keep a removed query's last
+    // result on screen. They're paused while locked, so nothing refetches.
+    void queryClient.resetQueries({ predicate: (query) => needsVault(host, query.queryKey) });
+  }, [unlocked, host, queryClient]);
   return <HostContext.Provider value={value}>{children}</HostContext.Provider>;
+}
+
+/** Whether a cached query (`[contractId, op, input]` or `[contractId, "_jobs"]`) came from something that needs the vault. */
+function needsVault(host: WebHost, key: QueryKey): boolean {
+  const [contractId, name] = key;
+  if (typeof contractId !== "string" || typeof name !== "string") return false;
+  const contract = host.contracts.get(contractId);
+  if (!contract) return false;
+  if (name === "_jobs") return true;
+  const op = (contract.queries as Record<string, OperationRef>)[name];
+  return op !== undefined && !runsLocked(op);
+}
+
+/** Whether the vault is unlocked, as the app told `<ModuleHostProvider unlocked>`. */
+export function useVaultUnlocked(): boolean {
+  return useHostContext().unlocked;
+}
+
+/**
+ * Renders `children` only while the vault is unlocked, else `fallback`
+ * (e.g. "Unlock to see this" with an unlock button). For parts of a page
+ * that need the vault, on a page that otherwise works while locked.
+ */
+export function WhenUnlocked({ children, fallback = null }: { children: ReactNode; fallback?: ReactNode }) {
+  return <>{useVaultUnlocked() ? children : fallback}</>;
 }
 
 export function useNavigate() {
@@ -704,15 +759,22 @@ class ContributionBoundary extends Component<{ label: string; children: ReactNod
 }
 
 /**
- * Opens the live-update socket while mounted. Place it where the vault is
- * known to be unlocked (the server refuses the socket otherwise). Incoming
- * events refetch the queries their contract names in `invalidates`, run
- * `useLiveEvent` handlers, and after a reconnect every live contract's
- * queries are refetched, since events may have been missed meanwhile.
+ * Opens the live-update socket while mounted. Without the host's
+ * `requireCaller` the server only admits unlocked sessions, so mount it
+ * where the vault is unlocked; with it, mount it once logged in and pass
+ * `onVaultChange` to hear about locks and unlocks right away (e.g. to
+ * re-check vault state). Incoming events refetch the queries their
+ * contract names in `invalidates`, run `useLiveEvent` handlers, and after
+ * a reconnect or an unlock every live contract's queries are refetched,
+ * since events may have been missed meanwhile.
  */
-export function LiveConnection() {
+export function LiveConnection({ onVaultChange }: { onVaultChange?: (unlocked: boolean) => void } = {}) {
   const { host } = useHostContext();
   const queryClient = useQueryClient();
+  const latest = useRef(onVaultChange);
+  useEffect(() => {
+    latest.current = onVaultChange;
+  });
   useEffect(
     () =>
       host.live.connect({
@@ -721,6 +783,7 @@ export function LiveConnection() {
         onReconnect: (contractIds) => {
           for (const id of contractIds) void queryClient.invalidateQueries({ queryKey: [id] });
         },
+        onVault: (unlocked) => latest.current?.(unlocked),
       }),
     [host, queryClient],
   );

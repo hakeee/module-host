@@ -300,6 +300,65 @@ describe("calls", () => {
   });
 });
 
+describe("vault: false operations", () => {
+  const profileContract = defineContract({
+    id: "profile",
+    version: 1,
+    queries: {
+      greeting: { input: z.object({}), output: z.string(), vault: false },
+      secret: { input: z.object({}), output: z.string() },
+    },
+  });
+  const profile = defineServerModule({
+    contract: profileContract,
+    implement: {
+      queries: {
+        greeting: (call) => {
+          // @ts-expect-error - no vault scope while locked
+          void call.vault;
+          expect("vault" in call).toBe(false);
+          return `hello ${call.userId}`;
+        },
+        secret: (call) => call.vault.name,
+      },
+    },
+  });
+  // Logged in = an `x-user` header; the session id is `x-session`, unlocked or not.
+  const requireCaller = (request: { headers: Record<string, unknown> }, reply: { code(n: number): { send(b: unknown): void } }) => {
+    const userId = Number(request.headers["x-user"]);
+    if (!userId) {
+      reply.code(401).send({ error: "login required" });
+      return undefined;
+    }
+    return { userId, sessionId: String(request.headers["x-session"] ?? "locked") };
+  };
+
+  it("needs the host's requireCaller", () => {
+    expect(() => buildHost([profile])).toThrow(/profile.greeting has vault: false/);
+  });
+
+  it("serves them to a logged-in caller with a locked vault, and nothing else", async () => {
+    const host = buildHost([profile], { requireCaller: requireCaller as never });
+    const app = Fastify();
+    await app.register(host.routes, { prefix: "/m" });
+    const rpc = (op: string, headers: Record<string, string>) =>
+      app.inject({ method: "POST", url: `/m/profile/rpc/${op}`, payload: {}, headers });
+
+    expect((await rpc("greeting", {})).statusCode).toBe(401);
+    const locked = await rpc("greeting", { "x-user": "7" });
+    expect(locked.statusCode).toBe(200);
+    expect(locked.json()).toBe("hello 7");
+    expect((await rpc("secret", { "x-user": "7" })).statusCode).toBe(423);
+    expect((await rpc("secret", { "x-user": "1", "x-session": "s1" })).json()).toBe("profile");
+  });
+
+  it("runs them in-process for a locked caller", async () => {
+    const host = buildHost([profile], { requireCaller: requireCaller as never });
+    expect(await host.client(profileContract).queries.greeting({ userId: 3, sessionId: "gone" }, {})).toBe("hello 3");
+    await expect(host.client(profileContract).queries.secret({ userId: 3, sessionId: "gone" }, {})).rejects.toThrow("vault locked");
+  });
+});
+
 describe("migrations", () => {
   it("applies each module's migrations with its own tracking table", () => {
     const folder = mkdtempSync(join(tmpdir(), "module-host-"));

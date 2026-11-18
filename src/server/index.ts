@@ -7,6 +7,7 @@ import {
   assertModuleId,
   isContract,
   operationsOf,
+  runsLocked,
   type AnyContract,
   type OperationDef,
   type OperationRef,
@@ -16,13 +17,13 @@ import type { Caller, Client } from "../client.js";
 import { ContractInputError, ContractValidationError, validate, type Input, type Output, type Schema } from "../standardSchema.js";
 import { createRemoteInvoker, registerInternalRoutes, relayLive, type RemoteDef } from "./internal.js";
 import { JOBS_TABLE, createJobStore, retryDelayMs, type JobRow, type JobStore, type RawSqlite } from "./jobs.js";
-import { createLiveHub, type LiveHub, type LiveMessage } from "./live.js";
+import { createLiveHub, type LiveHub, type LiveMessage, type VaultChange } from "./live.js";
 import { checkTables } from "./tables.js";
 
 export { checkTables, tablesOf } from "./tables.js";
 export type { Caller, Client } from "../client.js";
 export { JOBS_TABLE, retryDelayMs } from "./jobs.js";
-export { LIVE_CLOSE_VAULT_LOCKED, type LiveMessage } from "./live.js";
+export { LIVE_CLOSE_VAULT_LOCKED, type LiveMessage, type VaultChange } from "./live.js";
 export { ModuleRemoteError, type RemoteDef } from "./internal.js";
 
 // --- the app's database type ------------------------------------------------
@@ -90,8 +91,11 @@ type Requirement = AnyServerModule | AnyContract;
 
 type ContractOf<R> = R extends AnyContract ? R : R extends { readonly contract: infer C } ? (C extends AnyContract ? C : never) : never;
 
+/** `vault: false` operations get only the caller - there's no vault scope to hand them. */
+type CallFor<O extends OperationDef, L extends boolean> = O extends { readonly vault: false } ? Caller : CallContextFor<L>;
+
 type Handler<O extends OperationDef, L extends boolean> = (
-  call: CallContextFor<L>,
+  call: CallFor<O, L>,
   input: Output<O["input"]>,
 ) => Promise<Input<O["output"]>> | Input<O["output"]>;
 
@@ -251,6 +255,19 @@ export interface ServerHostOptions {
   requireVault(request: FastifyRequest, reply: FastifyReply): UnlockedRequest | undefined;
   /** The vault for a session id - e.g. `sessionCache.getVault`. */
   vaultFor(sessionId: string): VaultHandle | undefined;
+  /**
+   * Who's calling, needing only a login - e.g. vault-service's
+   * `createRequireCaller(...)`. Must reply itself when there's no login.
+   * Required for `vault: false` operations; with it, the live socket also
+   * opens while the vault is locked and reports lock/unlock to the tab.
+   */
+  requireCaller?(request: FastifyRequest, reply: FastifyReply): Caller | undefined;
+  /**
+   * Subscribes to vault lock/unlock - e.g. vault-service's
+   * `sessionCache.onChange`. Lets the live socket tell a tab right away;
+   * without it, the socket's heartbeat notices (every `live.heartbeatMs`).
+   */
+  vaultEvents?(listener: (change: VaultChange) => void): () => void;
   /** Tables outside any module that modules may reference, e.g. `["user"]`. */
   sharedTables?: readonly string[];
   logError?: (error: unknown, message: string) => void;
@@ -427,6 +444,10 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
     return buildCall(runtime, caller, vault);
   };
 
+  /** The context an operation's handler gets: just the caller for `vault: false`, else the vault scope (or a locked error). */
+  const callForOp = (runtime: Runtime, op: OperationRef, caller: Caller): CallContext =>
+    runsLocked(op) ? ({ userId: caller.userId, sessionId: caller.sessionId } as CallContext) : callFor(runtime, caller);
+
   const invoke = async (provider: Runtime, op: OperationRef, call: CallContext, rawInput: unknown) => {
     const where = `${op.contractId}.${op.name}`;
     let input: unknown;
@@ -462,7 +483,7 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
       Object.fromEntries(
         Object.entries(ops).map(([name, op]) => [
           name,
-          async (caller: Caller, input: unknown) => invoke(provider, op, callFor(provider, caller), input),
+          async (caller: Caller, input: unknown) => invoke(provider, op, callForOp(provider, op, caller), input),
         ]),
       );
     return { queries: section(contract.queries), commands: section(contract.commands) } as unknown as Client<AnyContract>;
@@ -501,6 +522,17 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
     });
     publishLive(caller.userId, { type: "jobs", module: module.id });
     return jobId;
+  }
+
+  if (!options.requireCaller) {
+    for (const module of modules) {
+      const locked = Object.values(module.contract ? operationsOf(module.contract) : {}).find(runsLocked);
+      if (locked) {
+        throw new ModuleCompositionError(
+          `${locked.contractId}.${locked.name} has vault: false, which needs the host's requireCaller option`,
+        );
+      }
+    }
   }
 
   for (const module of modules) {
@@ -708,7 +740,11 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
     jobs: jobRunner,
     liveConnectionCount: () => live?.connectionCount() ?? 0,
     async routes(app) {
-      if (live) await live.register(app, options.requireVault);
+      if (live) {
+        await live.register(app, options.requireCaller ?? options.requireVault);
+        const unsubscribe = options.vaultEvents?.((change) => live.vaultChanged(change));
+        if (unsubscribe) app.addHook("onClose", async () => unsubscribe());
+      }
       app.get("/_manifest", async () => ({
         modules: modules.map((m) => ({ id: m.id, contract: m.contract ? { id: m.contract.id, version: m.contract.version } : null })),
       }));
@@ -722,10 +758,20 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
               scope.post<{ Params: { op: string } }>("/rpc/:op", async (request, reply) => {
                 const op = ops[request.params.op];
                 if (!op || op.serverOnly) return reply.code(404).send({ error: "unknown operation" });
-                const unlocked = options.requireVault(request, reply);
-                if (!unlocked) return reply;
+                let call: CallContext;
+                if (runsLocked(op)) {
+                  const caller = options.requireCaller!(request, reply);
+                  if (!caller) return reply;
+                  call = callForOp(runtime, op, caller);
+                } else {
+                  const unlocked = options.requireVault(request, reply);
+                  if (!unlocked) return reply;
+                  call = buildCall(runtime, unlocked, unlocked.vault);
+                }
                 try {
-                  return await invoke(runtime, op, buildCall(runtime, unlocked, unlocked.vault), request.body ?? {});
+                  const result = await invoke(runtime, op, call, request.body ?? {});
+                  // Serialized here: Fastify sends a bare string as text/plain, which the browser can't parse as JSON.
+                  return reply.type("application/json; charset=utf-8").send(JSON.stringify(result));
                 } catch (error) {
                   if (error instanceof ContractInputError) {
                     return reply.code(400).send({ error: error.message });
@@ -796,8 +842,8 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
           if (version !== provider.module.contract!.version) {
             throw new OperationError(409, `caller built against "${contractId}" v${version}, this host implements v${provider.module.contract!.version}`);
           }
-          await options.prepareVault?.(caller.sessionId);
-          return invoke(provider, op, callFor(provider, caller), input);
+          if (!runsLocked(op)) await options.prepareVault?.(caller.sessionId);
+          return invoke(provider, op, callForOp(provider, op, caller), input);
         },
         publish: (userId, message) => live?.publish(userId, message),
       });
