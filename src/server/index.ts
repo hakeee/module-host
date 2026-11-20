@@ -10,8 +10,11 @@ import {
   actionsOf,
   operationsOf,
   runsLocked,
+  resourcesOf,
   type ActionInfo,
   type AnyContract,
+  type ResourceCheck,
+  type ResourceInfo,
   type OperationDef,
   type OperationRef,
 } from "../contract.js";
@@ -175,10 +178,19 @@ export interface ServerContext<
    * false` ones work without a session); IAM checks them as usual.
    */
   publicRoutes(plugin: (app: FastifyInstance) => Promise<void> | void): void;
-  /** Whether `caller` may perform `action` (always true without the host's `authorize`). For custom routes and declared actions. */
-  can(caller: Caller, action: string): Promise<boolean>;
+  /**
+   * Whether `caller` may perform `action` (always true without the host's
+   * `authorize`). For custom routes and declared actions, and with a
+   * `resource` (`contract.resources.client.of(id, attributes)`) for one
+   * record, inside operations that declare `resource`.
+   */
+  can(caller: Caller, action: string, resource?: ResourceCheck): Promise<boolean>;
+  /** The items `caller` may perform `action` on, each checked as the record `toResource` names. Order kept. */
+  filter<T>(caller: Caller, action: string, items: readonly T[], toResource: (item: T) => ResourceCheck): Promise<T[]>;
   /** Every action the installed modules define - e.g. for a policy editor. */
   actions(): readonly ActionInfo[];
+  /** Every resource type the installed modules define. */
+  resources(): readonly ResourceInfo[];
   /** For your own routes: this module's call context, or a 423 reply and undefined. */
   requireCall(request: FastifyRequest, reply: FastifyReply): CallContextFor<L> | undefined;
   /** This module's call context for a caller, e.g. a session id stored with a job. */
@@ -292,7 +304,7 @@ export interface ServerHostOptions {
    * is allowed. The built-in IAM module (`@hakeee/module-host/iam/server`)
    * provides one.
    */
-  authorize?(caller: Caller, action: string): boolean | Promise<boolean>;
+  authorize?(caller: Caller, action: string, resource?: ResourceCheck): boolean | Promise<boolean>;
   /** Actions checked outside the modules (e.g. vault-service's self-service ones), so `actions()` and policy editors list them. */
   extraActions?: readonly ActionInfo[];
   /** Tables outside any module that modules may reference, e.g. `["user"]`. */
@@ -365,6 +377,8 @@ export interface ServerHost {
   readonly jobs: JobRunner;
   /** Every action the installed modules define. */
   actions(): readonly ActionInfo[];
+  /** Every resource type the installed modules define. */
+  resources(): readonly ResourceInfo[];
   /** Open live-update sockets (for tests and diagnostics). */
   liveConnectionCount(): number;
   /** The internal channel (needs `internal.secret`): mount at a private prefix, outside your cookie-auth routes. */
@@ -485,7 +499,12 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
   const callForOp = (runtime: Runtime, op: OperationRef, caller: Caller): CallContext =>
     runsLocked(op) ? ({ userId: caller.userId, sessionId: caller.sessionId } as CallContext) : callFor(runtime, caller);
 
-  const can = async (caller: Caller, action: string) => (options.authorize ? await options.authorize(caller, action) : true);
+  const can = async (caller: Caller, action: string, resource?: ResourceCheck) =>
+    options.authorize ? await options.authorize(caller, action, resource) : true;
+  const filter = async <T>(caller: Caller, action: string, items: readonly T[], toResource: (item: T) => ResourceCheck) => {
+    const allowed = await Promise.all(items.map((item) => can(caller, action, toResource(item))));
+    return items.filter((_, i) => allowed[i]);
+  };
   const assertAllowed = async (caller: Caller, action: string) => {
     if (!(await can(caller, action))) throw new OperationError(403, `not allowed: ${action}`);
   };
@@ -582,6 +601,7 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
     ...(m.contract ? actionsOf(m.contract) : []),
     ...Object.keys(m.def.jobs ?? {}).map((name) => ({ action: `${m.id}:${name}`, kind: "job" as const })),
   ]).concat(options.extraActions ?? []);
+  const allResources: ResourceInfo[] = modules.flatMap((m) => (m.contract ? resourcesOf(m.contract) : []));
 
   for (const module of modules) {
     const runtime: Runtime = { module, visible: visibleContracts(module), routePlugins: [], publicRoutePlugins: [], handlers: {}, jobHandlers: {} };
@@ -620,7 +640,9 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
         runtime.publicRoutePlugins.push(plugin);
       },
       can,
+      filter,
       actions: () => allActions,
+      resources: () => allResources,
       requireCall(request, reply) {
         const unlocked = options.requireVault(request, reply);
         return unlocked ? (buildCall(runtime, unlocked, unlocked.vault) as never) : undefined;
@@ -793,6 +815,7 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
     },
     jobs: jobRunner,
     actions: () => allActions,
+    resources: () => allResources,
     liveConnectionCount: () => live?.connectionCount() ?? 0,
     async routes(app) {
       if (live) {

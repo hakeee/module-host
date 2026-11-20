@@ -23,6 +23,16 @@ export interface OperationDef {
    * unlocked vault (423 otherwise).
    */
   readonly vault?: boolean;
+  /**
+   * A resource type of this contract (`resources`) that the handler checks
+   * per record with `ctx.can(call, action, ref.of(id, attributes))`. Policy
+   * statements scoped to records (resources other than `"*"`, or
+   * conditions) only apply to operations that declare this: their allow
+   * lets the call run, and the handler decides record by record. Without
+   * it such statements are ignored, so a module that doesn't check records
+   * can never be opened up by them.
+   */
+  readonly resource?: string;
 }
 
 /** True when an operation runs without an unlocked vault (`vault: false`). */
@@ -89,6 +99,37 @@ export interface EventDef<S extends Schema = Schema> {
 }
 
 /**
+ * A kind of record policies can name: `<contract id>:<name>/<id>` (e.g.
+ * `clients:client/42`). `attributes` are what policy conditions may test
+ * (as `<contract id>:<attribute>`, e.g. `clients:trainers`); the module
+ * supplies their values for each record it checks.
+ */
+export interface ResourceDef {
+  readonly description?: string;
+  readonly attributes?: readonly string[];
+}
+
+/** A scalar or a list (a condition matches when any value equals any condition value). */
+export type ResourceAttributeValue = string | number | boolean | null | readonly (string | number | boolean)[];
+
+/** One record to authorize against: its full id and attributes with full keys. Built by `ResourceRef.of`. */
+export interface ResourceCheck {
+  readonly id: string;
+  readonly attributes: Readonly<Record<string, ResourceAttributeValue>>;
+}
+
+export interface ResourceRef<Id extends string = string, Name extends string = string, Attr extends string = string> {
+  readonly contractId: Id;
+  readonly name: Name;
+  /** `<contract id>:<name>`, as policies write it before `/<id>`. */
+  readonly type: string;
+  readonly description: string | undefined;
+  readonly attributes: readonly Attr[];
+  /** This record, for `ctx.can`: `clients.resources.client.of(42, { trainers: [2, 3] })`. */
+  of(id: string | number, attributes?: Partial<Record<Attr, ResourceAttributeValue>>): ResourceCheck;
+}
+
+/**
  * Something other modules can point at by id - a person, a tag, an entry.
  * `page` is a page of this contract with an `id` param; `labels` is a query
  * of this contract taking `{ ids: number[] }` and returning
@@ -112,6 +153,8 @@ export interface ContractDef {
   readonly slots?: Readonly<Record<string, SlotDef<any>>>;
   readonly components?: Readonly<Record<string, ComponentDef<any>>>;
   readonly entities?: Readonly<Record<string, EntityDef>>;
+  /** Record types policies can be scoped to (see `ResourceDef`). */
+  readonly resources?: Readonly<Record<string, ResourceDef>>;
   /**
    * Extra actions this module checks itself (custom routes, page access),
    * beyond the ones every operation and job already is. Local names; the
@@ -203,6 +246,13 @@ export type Contract<C extends ContractDef = ContractDef> = {
     >;
   };
   readonly entities: { readonly [K in keyof Section<C, "entities"> & string]: EntityRef<C["id"], K> };
+  readonly resources: {
+    readonly [K in keyof Section<C, "resources"> & string]: ResourceRef<
+      C["id"],
+      K,
+      Section<C, "resources">[K] extends { readonly attributes: readonly (infer A)[] } ? Narrow<A, string> : never
+    >;
+  };
   /** Declared extra actions, as full `module:action` strings. */
   readonly actions: readonly string[];
 };
@@ -245,6 +295,37 @@ export function defineContract<const C extends ContractDef>(def: C & EntityConst
   const refs = <T extends object, R>(section: Readonly<Record<string, T>> | undefined, build: (name: string, value: T) => R) =>
     Object.fromEntries(Object.entries(section ?? {}).map(([name, value]) => [name, build(name, value)]));
 
+  const resources = refs(def.resources, (name, resource): ResourceRef => {
+    assertModuleId(name, "resource name");
+    const type = `${def.id}:${name}`;
+    const attributes = [...(resource.attributes ?? [])];
+    return {
+      contractId: def.id,
+      name,
+      type,
+      description: resource.description,
+      attributes,
+      of(id, values = {}) {
+        if (/[/*]/.test(String(id))) throw new Error(`${type}: a resource id can't contain "/" or "*"`);
+        return {
+          id: `${type}/${id}`,
+          attributes: Object.fromEntries(
+            Object.entries(values)
+              .filter(([key]) => attributes.includes(key))
+              .map(([key, value]) => [`${def.id}:${key}`, value as ResourceAttributeValue]),
+          ),
+        };
+      },
+    };
+  });
+  for (const [kind, section] of [["query", def.queries], ["command", def.commands]] as const) {
+    for (const [name, op] of Object.entries(section ?? {})) {
+      if (op.resource !== undefined && !resources[op.resource]) {
+        throw new Error(`contract "${def.id}": ${kind} "${name}" names unknown resource "${op.resource}"`);
+      }
+    }
+  }
+
   const queries = refs(def.queries, (name, op) => ({ ...op, contractId: def.id, kind: "query" as const, name }));
   const commands = refs(def.commands, (name, op) => ({ ...op, contractId: def.id, kind: "command" as const, name }));
   for (const name of Object.keys(commands)) {
@@ -283,6 +364,7 @@ export function defineContract<const C extends ContractDef>(def: C & EntityConst
     slots: refs(def.slots, (name, s) => ({ ...s, contractId: def.id, name })),
     components: refs(def.components, (name, c) => ({ ...c, contractId: def.id, name })),
     entities,
+    resources,
     actions: (def.actions ?? []).map((name) => fullAction(def.id, name)),
   } as unknown as Contract<C>;
 }
@@ -312,13 +394,33 @@ export type ActionKind = "query" | "command" | "job" | "declared" | "self-servic
 export interface ActionInfo {
   readonly action: string;
   readonly kind: ActionKind;
+  /** The resource type it checks per record (`clients:client`), for operations that declare `resource`. */
+  readonly resource?: string;
 }
+
+/** A record type an installed module defines, for policy editors. */
+export interface ResourceInfo {
+  readonly type: string;
+  readonly description?: string;
+  /** Condition keys (`clients:trainers`). */
+  readonly attributes: readonly string[];
+}
+
+export function resourcesOf(contract: AnyContract): ResourceInfo[] {
+  return Object.values(contract.resources as Record<string, ResourceRef>).map((r) => ({
+    type: r.type,
+    ...(r.description ? { description: r.description } : {}),
+    attributes: r.attributes.map((a) => `${contract.id}:${a}`),
+  }));
+}
+
+const resourceOf = (contractId: string, op: OperationDef) => (op.resource ? { resource: `${contractId}:${op.resource}` } : {});
 
 /** Every action a contract defines (operations and declared ones; jobs are server-side only). */
 export function actionsOf(contract: AnyContract): ActionInfo[] {
   return [
-    ...Object.values(contract.queries as Record<string, OperationRef>).map((op) => ({ action: actionOf(op), kind: "query" as const })),
-    ...Object.values(contract.commands as Record<string, OperationRef>).map((op) => ({ action: actionOf(op), kind: "command" as const })),
+    ...Object.values(contract.queries as Record<string, OperationRef>).map((op) => ({ action: actionOf(op), kind: "query" as const, ...resourceOf(contract.id, op) })),
+    ...Object.values(contract.commands as Record<string, OperationRef>).map((op) => ({ action: actionOf(op), kind: "command" as const, ...resourceOf(contract.id, op) })),
     ...(contract.actions ?? []).map((action) => ({ action, kind: "declared" as const })),
   ];
 }

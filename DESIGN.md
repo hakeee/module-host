@@ -400,7 +400,25 @@ Every operation is an **action**: `module:operation` (`notes:list`,
     Wildcards work anywhere and matching is case-insensitive. An explicit
     deny beats any allow, and anything not allowed is denied.
   - `kind: "query" | "command"` narrows a statement to reads or writes.
-    `resources` is reserved: only `"*"` applies today.
+  - **Records.** `resources` (`clients:client/42`, `clients:client/*`) and
+    `conditions` (`{ "clients:trainers": "${user.id}" }`) scope a statement
+    to some records. A contract declares its record types
+    (`resources: { client: { attributes: ["trainers"] } }`), an operation
+    that checks records says `resource: "client"`, and its handler checks
+    each one with `ctx.can(call, action, contract.resources.client.of(id,
+    attributes))` or `ctx.filter(...)`, redacting rather than failing where
+    a record appears inside something else.
+    - For the operation itself, a scoped *allow* lets a record-checking
+      operation run; on any other operation scoped statements are ignored,
+      so they can't open up code that doesn't check records, and a scoped
+      deny never blocks a whole operation.
+    - A condition matches when any attribute value equals any listed value;
+      all conditions must match; a missing attribute never matches.
+      `${user.id}` is the only variable, and saving a policy rejects
+      statements that could never match.
+    - `iam.resources` lists record types for editors; `iam.actions` marks
+      record-checking actions. The browser's `useCan` answers for the
+      operation only; record checks are the server's.
   - Managed policies: AdministratorAccess (`*`) and ReadOnlyAccess (every
     query except IAM's). Starter roles `admin` and `member` are created on a
     fresh install and are ordinary data afterwards.

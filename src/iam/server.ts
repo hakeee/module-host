@@ -1,9 +1,9 @@
 import { fileURLToPath } from "node:url";
-import { OperationError, type ActionKind } from "../contract.js";
+import { OperationError, type ActionKind, type ResourceCheck } from "../contract.js";
 import type { Caller } from "../client.js";
 import { defineServerModule } from "../server/index.js";
 import { iamContract } from "./contract.js";
-import { MANAGED_POLICIES, STARTER_ROLES, evaluate, isDenied, type PolicyDocument, type PolicyStatement } from "./policy.js";
+import { MANAGED_POLICIES, STARTER_ROLES, evaluate, isDenied, statementProblems, type ActionMeta, type PolicyDocument, type PolicyStatement } from "./policy.js";
 import { iamPolicy, iamRole, iamRolePolicy, iamRoot, iamUserRole } from "./schema.js";
 
 export interface IamAccount {
@@ -105,8 +105,8 @@ export function createIam(options: IamOptions) {
     }
   }
   let raw: Raw | undefined;
-  let actionKinds: Map<string, ActionKind> | undefined;
-  let listActions: () => readonly { action: string; kind: ActionKind }[] = () => [];
+  let actionInfo: Map<string, ActionMeta> | undefined;
+  let listActions: () => readonly { action: string; kind: ActionKind; resource?: string }[] = () => [];
   let seeded = false;
   let rootId: number | undefined;
   const statementsByUser = new Map<number, PolicyStatement[]>();
@@ -115,7 +115,7 @@ export function createIam(options: IamOptions) {
     if (!raw) throw new Error("IAM: the module isn't installed in a server host");
     return raw;
   };
-  const kindOf = (action: string) => (actionKinds ??= new Map(listActions().map((a) => [a.action, a.kind]))).get(action);
+  const infoOf = (action: string) => (actionInfo ??= new Map(listActions().map((a) => [a.action, { kind: a.kind, resource: a.resource }]))).get(action);
   const changed = () => statementsByUser.clear();
 
   /** Managed policies always match this code; starter roles only appear on a fresh install. */
@@ -175,12 +175,13 @@ export function createIam(options: IamOptions) {
   };
 
   const selfServiceActions = () => listActions().filter((a) => a.kind === "self-service").map((a) => a.action);
-  const allowedFor = (userId: number, action: string): boolean => {
+  const allowedFor = (userId: number, action: string, resource?: ResourceCheck): boolean => {
     if (ALWAYS_ALLOWED.has(action)) return true;
     seed();
     if (userId === root()) return true;
-    if (kindOf(action) === "self-service") return !isDenied(statementsFor(userId), action, kindOf);
-    return evaluate(statementsFor(userId), action, kindOf);
+    const request = { userId, resource };
+    if (infoOf(action)?.kind === "self-service") return !isDenied(statementsFor(userId), action, infoOf, request);
+    return evaluate(statementsFor(userId), action, infoOf, request);
   };
   /** Admin actions on someone else's account: never root, and (for disabling) not yourself. */
   const assertTarget = (callerId: number, userId: number, what: string, notSelf = false) => {
@@ -266,6 +267,7 @@ export function createIam(options: IamOptions) {
             ).map((p) => ({ name: p.name, description: p.description, managed: p.managed === 1, document: JSON.parse(p.document) }));
           },
           actions: () => [...ctx.actions()].sort((a, b) => a.action.localeCompare(b.action)),
+          resources: () => [...ctx.resources()].map((r) => ({ ...r, attributes: [...r.attributes] })).sort((a, b) => a.type.localeCompare(b.type)),
           settings: () => ({
             canCreateUsers: options.accounts.create !== undefined,
             canDisableUsers: options.accounts.disable !== undefined && options.accounts.enable !== undefined,
@@ -342,6 +344,8 @@ export function createIam(options: IamOptions) {
           putPolicy: (_call, { name, description, document }) => {
             seed();
             if (name in managedPolicies) throw new OperationError(400, `${name} is managed and can't be changed`);
+            const problems = document.statements.flatMap((statement, i) => statementProblems(statement).map((p) => `statement ${i + 1}: ${p}`));
+            if (problems.length > 0) throw new OperationError(400, problems.join("; "));
             db()
               .prepare(
                 `INSERT INTO iam_policy (name, description, document, managed) VALUES (?, ?, ?, 0)
@@ -373,8 +377,8 @@ export function createIam(options: IamOptions) {
      * For the host's `authorize`, and vault-service's (its self-service
      * actions are allowed unless a policy explicitly denies them).
      */
-    authorize(caller: Caller, action: string): boolean {
-      return allowedFor(caller.userId, action);
+    authorize(caller: Caller, action: string, resource?: ResourceCheck): boolean {
+      return allowedFor(caller.userId, action, resource);
     },
 
     /** For vault-service's `onLogin`: OIDC role mapping, and default roles for new signups. */

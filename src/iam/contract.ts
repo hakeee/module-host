@@ -9,6 +9,7 @@ export const policyStatementSchema = z.object({
   notActions: z.array(z.string().min(1)).optional(),
   kind: z.enum(["query", "command"]).optional(),
   resources: z.array(z.string().min(1)).optional(),
+  conditions: z.record(z.string().min(1), z.union([z.string(), z.array(z.string())])).optional(),
 });
 
 export const policyDocumentSchema = z.object({
@@ -65,9 +66,17 @@ export const iamContract = defineContract({
       vault: false,
     },
     /** Every action the installed modules define, for policy editors. */
+    /** Record types policies can be scoped to, with the attributes conditions may test. */
+    resources: {
+      input: none,
+      output: z.array(z.object({ type: z.string(), description: z.string().optional(), attributes: z.array(z.string()) })),
+      vault: false,
+    },
     actions: {
       input: none,
-      output: z.array(z.object({ action: z.string(), kind: z.enum(["query", "command", "job", "declared", "self-service"]) })),
+      output: z.array(
+        z.object({ action: z.string(), kind: z.enum(["query", "command", "job", "declared", "self-service"]), resource: z.string().optional() }),
+      ),
       vault: false,
     },
     /** What this install supports, e.g. creating accounts (not in OIDC mode). */
