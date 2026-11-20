@@ -145,6 +145,24 @@ export default defineServerModule({
 - **Events** run in-process after `emit` and are awaited. Each subscriber
   gets its own call context. A failing subscriber is logged and doesn't
   fail the emitter.
+- **Privacy (GDPR) hooks.** A module says how to export and how to erase
+  what it holds about one data subject: `ctx.privacy.handle("user", {
+  export, erase })`, or an app-defined subject such as `"client"`. A
+  coordinating module runs everyone's with `ctx.privacy.run("export" |
+  "erase", call, subject, id, { terms, id })`.
+  - Exports run in dependency order, erasures dependents first (contract
+    requirements count).
+  - Hooks get the requesting caller, plus the module's own vault scope when
+    the request runs unlocked, so encrypted data can be exported only by its
+    owner. `terms` (e.g. a name) let hooks list free text that mentions the
+    subject for a person to review; `id` lets a hook whose part arrives later
+    tie it to the request.
+  - `erase` returns a report: `removed`, `anonymized`, `kept` (with why) and
+    `review` items.
+  - With the host option `requirePrivacy`, every module with tables must
+    register hooks or call `ctx.privacy.none(reason)`, or the host refuses to
+    boot. Off by default. The built-in IAM module handles `"user"` (its roles;
+    root is never erased).
 
 ### Database
 

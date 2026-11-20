@@ -144,6 +144,40 @@ export interface ModuleJobs<J extends JobDefs, L extends boolean> {
   pendingCount(userId: number, name?: keyof J & string): number;
 }
 
+/**
+ * GDPR plumbing: each module says how to export and how to erase what it
+ * holds about one data subject (`"user"`, or an app-defined type such as
+ * `"client"`), and a coordinating module runs them all with
+ * `ctx.privacy.run`. Hooks get the requesting caller (with a vault scope
+ * when the request runs unlocked) and work on the module's own tables.
+ */
+export interface PrivacyHooks {
+  /** JSON-safe data about the subject (left out of the result when undefined). */
+  export?(call: PrivacyCall, subjectId: number, request: PrivacyRequest): unknown;
+  /** Removes or anonymises what the module holds about the subject, and says what it did. */
+  erase?(call: PrivacyCall, subjectId: number, request: PrivacyRequest): ErasureReport | void | Promise<ErasureReport | void>;
+}
+/** The requesting caller; `vault` is this module's own scope when the request has one (unlocked). */
+export type PrivacyCall = Caller & { readonly vault?: VaultScope };
+export interface PrivacyRequest {
+  /** Words that identify the subject (a name), for finding them in free text the module can't erase by id. */
+  readonly terms: readonly string[];
+  /** The coordinator's id for this request, for hooks whose part arrives later (e.g. data only its owner can decrypt). */
+  readonly id?: string;
+}
+export interface ErasureReport {
+  readonly removed?: number;
+  readonly anonymized?: number;
+  /** Kept on purpose (e.g. accounting records), with why. */
+  readonly kept?: readonly { count: number; why: string }[];
+  /** Free text that mentions the subject, for a person to review. */
+  readonly review?: readonly { what: string; ref: string; excerpt: string }[];
+}
+export interface PrivacyResult<T> {
+  readonly module: string;
+  readonly result: T;
+}
+
 export interface ServerContext<
   C extends AnyContract | undefined,
   R extends readonly Requirement[],
@@ -167,6 +201,18 @@ export interface ServerContext<
     event: E,
     handler: (call: CallContextFor<L>, payload: Output<EventPayload<U, E>>) => Promise<void> | void,
   ): void;
+  /** GDPR export and erasure hooks (see `PrivacyHooks`), and running everyone's. */
+  readonly privacy: {
+    /** This module's hooks for one subject type. */
+    handle(subject: string, hooks: PrivacyHooks): void;
+    /** Declares that this module holds no personal data (checked at boot with the host's `requirePrivacy`). */
+    none(reason: string): void;
+    /** Every module's hook for the subject: exports in dependency order, erasures dependents first. */
+    run(kind: "export", call: Caller, subject: string, subjectId: number, request?: Partial<PrivacyRequest>): Promise<PrivacyResult<unknown>[]>;
+    run(kind: "erase", call: Caller, subject: string, subjectId: number, request?: Partial<PrivacyRequest>): Promise<PrivacyResult<ErasureReport>[]>;
+    /** Subject types some module handles. */
+    subjects(): string[];
+  };
   /** Adds Fastify routes under `/<prefix>/<module id>`. Prefer contract operations; use this for what doesn't fit (uploads, streaming). */
   routes(plugin: (app: FastifyInstance) => Promise<void> | void): void;
   /**
@@ -332,6 +378,12 @@ export interface ServerHostOptions {
   remotes?: readonly RemoteDef[];
   /** Forward live messages to the host that holds the browsers' sockets (a worker -> the API). */
   liveRelay?: { url: string; secret: string };
+  /**
+   * Boot check for GDPR: every module with tables must register privacy
+   * hooks (`ctx.privacy.handle`) or say it holds no personal data
+   * (`ctx.privacy.none`). Off by default.
+   */
+  requirePrivacy?: boolean;
   /** Per-IP limit for `publicRoutes` (default 120 requests a minute); over it, a 429. */
   publicRateLimit?: { max: number; windowMs: number };
 }
@@ -358,6 +410,8 @@ interface Runtime {
   visible: Set<string>;
   routePlugins: ((app: FastifyInstance) => Promise<void> | void)[];
   publicRoutePlugins: ((app: FastifyInstance) => Promise<void> | void)[];
+  privacy: Map<string, PrivacyHooks>;
+  privacyNone?: string;
   handlers: Record<string, (call: CallContext, input: unknown) => unknown>;
   jobHandlers: Record<string, (call: CallContext, payload: unknown) => Promise<void> | void>;
 }
@@ -604,7 +658,7 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
   const allResources: ResourceInfo[] = modules.flatMap((m) => (m.contract ? resourcesOf(m.contract) : []));
 
   for (const module of modules) {
-    const runtime: Runtime = { module, visible: visibleContracts(module), routePlugins: [], publicRoutePlugins: [], handlers: {}, jobHandlers: {} };
+    const runtime: Runtime = { module, visible: visibleContracts(module), routePlugins: [], publicRoutePlugins: [], privacy: new Map(), handlers: {}, jobHandlers: {} };
     runtimes.set(module.id, runtime);
     if (module.contract) providerOf.set(module.contract.id, runtime);
   }
@@ -638,6 +692,17 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
       },
       publicRoutes(plugin) {
         runtime.publicRoutePlugins.push(plugin);
+      },
+      privacy: {
+        handle(subject, hooks) {
+          if (runtime.privacy.has(subject)) throw new ModuleCompositionError(`"${module.id}" handles privacy subject "${subject}" twice`);
+          runtime.privacy.set(subject, hooks);
+        },
+        none(reason) {
+          runtime.privacyNone = reason;
+        },
+        run: runPrivacy as never,
+        subjects: () => [...new Set([...runtimes.values()].flatMap((r) => [...r.privacy.keys()]))].sort(),
       },
       can,
       filter,
@@ -690,6 +755,47 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
     for (const name of Object.keys(module.def.jobs ?? {})) {
       if (!runtime.jobHandlers[name]) throw new ModuleCompositionError(`"${module.id}" declares job "${name}" but never handles it`);
     }
+    if (options.requirePrivacy && module.def.schema && Object.keys(module.def.schema).length > 0 && runtime.privacy.size === 0 && !runtime.privacyNone) {
+      throw new ModuleCompositionError(`"${module.id}" has tables but no privacy hooks: call ctx.privacy.handle(...) or ctx.privacy.none(reason)`);
+    }
+  }
+
+  /** Runtimes with every module after the providers of what it requires (contracts included, unlike `modules`' order). */
+  function byDependency(): Runtime[] {
+    const out: Runtime[] = [];
+    const done = new Set<Runtime>();
+    const visit = (runtime: Runtime) => {
+      if (done.has(runtime)) return;
+      done.add(runtime);
+      for (const requirement of runtime.module.requires) {
+        const contract = "__contract" in requirement ? requirement : requirement.contract;
+        const provider = contract ? providerOf.get(contract.id) : undefined;
+        if (provider) visit(provider);
+      }
+      out.push(runtime);
+    };
+    for (const runtime of runtimes.values()) visit(runtime);
+    return out;
+  }
+
+  async function runPrivacy(kind: "export" | "erase", caller: Caller, subject: string, subjectId: number, request: Partial<PrivacyRequest> = {}) {
+    const vault = options.vaultFor(caller.sessionId);
+    const full: PrivacyRequest = { terms: (request.terms ?? []).filter((t) => t.trim().length > 0), ...(request.id ? { id: request.id } : {}) };
+    const ordered = byDependency();
+    // Erase dependents first, so nothing points at what its requirement already removed.
+    if (kind === "erase") ordered.reverse();
+    const results: PrivacyResult<unknown>[] = [];
+    for (const runtime of ordered) {
+      const hook = runtime.privacy.get(subject)?.[kind];
+      if (!hook) continue;
+      const call: PrivacyCall =
+        vault && vault.userId === caller.userId
+          ? { userId: caller.userId, sessionId: caller.sessionId, vault: vault.scope(runtime.module.id) }
+          : { userId: caller.userId, sessionId: caller.sessionId };
+      const result = await hook(call, subjectId, full);
+      if (result !== undefined) results.push({ module: runtime.module.id, result });
+    }
+    return results;
   }
 
   const LOCKED_RETRY_MS = 30_000;

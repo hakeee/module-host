@@ -218,6 +218,19 @@ export function createIam(options: IamOptions) {
       // ours may differ (linked repos), and these queries are simple.
       raw = (ctx.db as unknown as { $client: Raw }).$client;
       listActions = ctx.actions;
+      // GDPR: a person's roles are data about them. Root is the install's owner and is never erased.
+      ctx.privacy.handle("user", {
+        export: (_call, userId) => ({
+          root: userId === root(),
+          roles: db().prepare("SELECT role, source FROM iam_user_role WHERE user_id = ? ORDER BY role").all(userId) as { role: string; source: string }[],
+        }),
+        erase: (_call, userId) => {
+          if (userId === root()) throw new OperationError(400, "root can't be erased");
+          const removed = (db().prepare("DELETE FROM iam_user_role WHERE user_id = ?").run(userId) as { changes: number }).changes;
+          changed();
+          return { removed };
+        },
+      });
       return {
         queries: {
           myAccess: (call) => {
