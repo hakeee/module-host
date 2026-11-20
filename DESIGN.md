@@ -106,6 +106,7 @@ export default defineServerModule({
   setup(ctx) {
     ctx.on(journalContract, "entryCreated", (call, payload) => ...);
     ctx.routes((app) => app.post("/upload", ...));   // for things that don't fit an operation
+    ctx.publicRoutes((app) => app.get("/:token", ...)); // no login: feeds, webhooks
   },
 });
 ```
@@ -124,6 +125,16 @@ export default defineServerModule({
   HTTP it becomes that status.
 - **HTTP:** every operation is served at `POST /<prefix>/<module>/rpc/<op>`,
   behind the app's auth hook. A locked vault gets a 423.
+- **Public routes** (`ctx.publicRoutes`) are reachable **without a
+  login**, for things a browser session can't carry: calendar feeds,
+  webhooks, booking pages. The app mounts `host.publicRoutes` under its own
+  prefix (e.g. `/p`), *outside* its auth hook, and the module authenticates
+  each request itself (a secret token, a signature). The host rate-limits
+  them per IP (`publicRateLimit`, default 120 a minute) and turns an
+  `OperationError` into its status. To act as a user, call operations with
+  `{ userId, sessionId }`: they go through IAM like any other call, so a
+  feed shows only what its owner may see. Only `vault: false` operations
+  work that way, since there is no unlocked session behind the request.
 - **`vault: false`** on an operation lets it run for a logged-in caller
   whose vault is locked (e.g. the user's email, a count, a setting). Its
   handler gets only `{ userId, sessionId }`, with no vault scope, so the

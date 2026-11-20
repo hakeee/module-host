@@ -166,6 +166,15 @@ export interface ServerContext<
   ): void;
   /** Adds Fastify routes under `/<prefix>/<module id>`. Prefer contract operations; use this for what doesn't fit (uploads, streaming). */
   routes(plugin: (app: FastifyInstance) => Promise<void> | void): void;
+  /**
+   * Adds Fastify routes reachable **without a login**, under the host's
+   * `publicRoutes` mount (`/<public prefix>/<module id>`): calendar feeds,
+   * webhooks, booking pages. The module authenticates each request itself
+   * (a secret token, a signature). Rate-limited per IP by the host. To act
+   * as a user, call operations with `{ userId, sessionId }` (only `vault:
+   * false` ones work without a session); IAM checks them as usual.
+   */
+  publicRoutes(plugin: (app: FastifyInstance) => Promise<void> | void): void;
   /** Whether `caller` may perform `action` (always true without the host's `authorize`). For custom routes and declared actions. */
   can(caller: Caller, action: string): Promise<boolean>;
   /** Every action the installed modules define - e.g. for a policy editor. */
@@ -311,6 +320,8 @@ export interface ServerHostOptions {
   remotes?: readonly RemoteDef[];
   /** Forward live messages to the host that holds the browsers' sockets (a worker -> the API). */
   liveRelay?: { url: string; secret: string };
+  /** Per-IP limit for `publicRoutes` (default 120 requests a minute); over it, a 429. */
+  publicRateLimit?: { max: number; windowMs: number };
 }
 
 export interface JobEvent {
@@ -334,6 +345,7 @@ interface Runtime {
   module: AnyServerModule;
   visible: Set<string>;
   routePlugins: ((app: FastifyInstance) => Promise<void> | void)[];
+  publicRoutePlugins: ((app: FastifyInstance) => Promise<void> | void)[];
   handlers: Record<string, (call: CallContext, input: unknown) => unknown>;
   jobHandlers: Record<string, (call: CallContext, payload: unknown) => Promise<void> | void>;
 }
@@ -357,6 +369,11 @@ export interface ServerHost {
   liveConnectionCount(): number;
   /** The internal channel (needs `internal.secret`): mount at a private prefix, outside your cookie-auth routes. */
   internalRoutes(app: FastifyInstance): Promise<void>;
+  /**
+   * Fastify plugin with every module's `ctx.publicRoutes`, at `/<module id>`.
+   * Mount it under its own prefix (e.g. `/p`) **outside** your auth hook.
+   */
+  publicRoutes(app: FastifyInstance): Promise<void>;
 }
 
 export interface JobSummary {
@@ -567,7 +584,7 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
   ]).concat(options.extraActions ?? []);
 
   for (const module of modules) {
-    const runtime: Runtime = { module, visible: visibleContracts(module), routePlugins: [], handlers: {}, jobHandlers: {} };
+    const runtime: Runtime = { module, visible: visibleContracts(module), routePlugins: [], publicRoutePlugins: [], handlers: {}, jobHandlers: {} };
     runtimes.set(module.id, runtime);
     if (module.contract) providerOf.set(module.contract.id, runtime);
   }
@@ -598,6 +615,9 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
       },
       routes(plugin) {
         runtime.routePlugins.push(plugin);
+      },
+      publicRoutes(plugin) {
+        runtime.publicRoutePlugins.push(plugin);
       },
       can,
       actions: () => allActions,
@@ -857,6 +877,32 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
     },
     client(contract) {
       return clientFor(contract) as never;
+    },
+    async publicRoutes(app) {
+      const { max, windowMs } = options.publicRateLimit ?? { max: 120, windowMs: 60_000 };
+      const hits = new Map<string, { count: number; resetAt: number }>();
+      app.addHook("onRequest", async (request, reply) => {
+        const now = Date.now();
+        // Drop expired buckets now and then so the map can't grow without bound.
+        if (hits.size > 10_000) for (const [ip, h] of hits) if (h.resetAt <= now) hits.delete(ip);
+        const bucket = hits.get(request.ip);
+        if (!bucket || bucket.resetAt <= now) hits.set(request.ip, { count: 1, resetAt: now + windowMs });
+        else if (++bucket.count > max) return reply.code(429).header("retry-after", Math.ceil((bucket.resetAt - now) / 1000)).send({ error: "too many requests" });
+      });
+      app.setErrorHandler((error, _request, reply) => {
+        if (error instanceof OperationError) return reply.code(error.status).send({ error: error.message });
+        logError(error, "module-host: public route failed");
+        return reply.code(500).send({ error: "internal error" });
+      });
+      for (const runtime of runtimes.values()) {
+        if (runtime.publicRoutePlugins.length === 0) continue;
+        await app.register(
+          async (scope) => {
+            for (const plugin of runtime.publicRoutePlugins) await plugin(scope);
+          },
+          { prefix: `/${runtime.module.id}` },
+        );
+      }
     },
     async internalRoutes(app) {
       const internal = options.internal;
