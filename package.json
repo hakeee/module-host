@@ -95,7 +95,7 @@
     "better-sqlite3": "^13.0.3",
     "drizzle-kit": "^0.31.11",
     "drizzle-orm": "^0.45.4",
-    "fastify": "^5.12.5",
+    "fastify": "^5.12.8",
     "happy-dom": "^20.14.6",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
