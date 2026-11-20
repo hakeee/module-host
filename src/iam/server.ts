@@ -44,6 +44,18 @@ export interface IamOptions {
   /** Roles given to accounts created by signing up (not by an admin, who picks roles). */
   defaultRoles?: readonly string[];
   /**
+   * The app's own managed policies, next to AdministratorAccess and
+   * ReadOnlyAccess: kept matching this code on every boot, and not
+   * editable or deletable in the UI. Names can't reuse a built-in one.
+   */
+  policies?: Readonly<Record<string, { description: string; document: PolicyDocument }>>;
+  /**
+   * Roles created on a fresh install, instead of the built-in `admin` and
+   * `member`. Ordinary data afterwards, like those. Their policies must be
+   * managed ones (built-in or `policies`).
+   */
+  starterRoles?: Readonly<Record<string, { description: string; policies: readonly string[] }>>;
+  /**
    * OIDC: IdP role -> IAM role, applied at every login (replacing the
    * previous login's). `rolesFromClaims` reads the IdP roles; the default
    * understands Zitadel's `urn:zitadel:iam:org:project[:<id>]:roles` claim.
@@ -82,6 +94,16 @@ export function zitadelRoles(claims: Record<string, unknown>): string[] {
  * see ./policy.ts. Root is allowed everything.
  */
 export function createIam(options: IamOptions) {
+  for (const name of Object.keys(options.policies ?? {})) {
+    if (name in MANAGED_POLICIES) throw new Error(`IAM: policy "${name}" is built in and can't be redefined`);
+  }
+  const managedPolicies = { ...MANAGED_POLICIES, ...options.policies };
+  const starterRoles = options.starterRoles ?? STARTER_ROLES;
+  for (const [role, { policies }] of Object.entries(starterRoles)) {
+    for (const policy of policies) {
+      if (!(policy in managedPolicies)) throw new Error(`IAM: starter role "${role}" uses "${policy}", which isn't a managed policy`);
+    }
+  }
   let raw: Raw | undefined;
   let actionKinds: Map<string, ActionKind> | undefined;
   let listActions: () => readonly { action: string; kind: ActionKind }[] = () => [];
@@ -102,7 +124,7 @@ export function createIam(options: IamOptions) {
     const sql = db();
     sql.transaction(() => {
       const fresh = !sql.prepare("SELECT 1 FROM iam_root").get() && !sql.prepare("SELECT 1 FROM iam_role").get();
-      for (const [name, policy] of Object.entries(MANAGED_POLICIES)) {
+      for (const [name, policy] of Object.entries(managedPolicies)) {
         sql
           .prepare(
             `INSERT INTO iam_policy (name, description, document, managed) VALUES (?, ?, ?, 1)
@@ -111,7 +133,7 @@ export function createIam(options: IamOptions) {
           .run(name, policy.description, JSON.stringify(policy.document));
       }
       if (fresh) {
-        for (const [name, role] of Object.entries(STARTER_ROLES)) {
+        for (const [name, role] of Object.entries(starterRoles)) {
           sql.prepare("INSERT INTO iam_role (name, description) VALUES (?, ?)").run(name, role.description);
           for (const policy of role.policies) sql.prepare("INSERT INTO iam_role_policy (role, policy) VALUES (?, ?)").run(name, policy);
         }
@@ -319,7 +341,7 @@ export function createIam(options: IamOptions) {
           },
           putPolicy: (_call, { name, description, document }) => {
             seed();
-            if (name in MANAGED_POLICIES) throw new OperationError(400, `${name} is managed and can't be changed`);
+            if (name in managedPolicies) throw new OperationError(400, `${name} is managed and can't be changed`);
             db()
               .prepare(
                 `INSERT INTO iam_policy (name, description, document, managed) VALUES (?, ?, ?, 0)
@@ -330,7 +352,7 @@ export function createIam(options: IamOptions) {
             return {};
           },
           deletePolicy: (_call, { name }) => {
-            if (name in MANAGED_POLICIES) throw new OperationError(400, `${name} is managed and can't be deleted`);
+            if (name in managedPolicies) throw new OperationError(400, `${name} is managed and can't be deleted`);
             const sql = db();
             sql.transaction(() => {
               sql.prepare("DELETE FROM iam_role_policy WHERE policy = ?").run(name);

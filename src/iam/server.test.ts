@@ -39,7 +39,7 @@ const notes = defineServerModule({
 
 const accountCalls: string[] = [];
 
-function setup() {
+function setup(options: Partial<Parameters<typeof createIam>[0]> = {}) {
   sessions.clear();
   const sqlite = new Database(":memory:");
   sqlite.exec("CREATE TABLE user (id INTEGER PRIMARY KEY, email TEXT NOT NULL, display_name TEXT NOT NULL)");
@@ -66,7 +66,7 @@ function setup() {
       return userId === 99 ? ({ error: "no-local-login" } as const) : ({ ok: true } as const);
     },
   };
-  const iam = createIam({ accounts, defaultRoles: ["member"], oidc: { roleMap: { "app-admin": "admin" } } });
+  const iam = createIam({ accounts, defaultRoles: ["member"], oidc: { roleMap: { "app-admin": "admin" } }, ...options });
   const host = createServerHost({
     modules: [iam.module, notes],
     db,
@@ -144,6 +144,28 @@ describe("IAM", () => {
     await expect(env.host.client(notesContract).commands.create(unlock(member), { text: "x" })).rejects.toMatchObject({ status: 403 });
     // IAM's own operations are actions too: a member can't change roles.
     await expect(client.commands.setUserRoles(unlock(member), { userId: member, roles: ["admin"] })).rejects.toMatchObject({ status: 403 });
+  });
+
+  it("seeds the app's own managed policies and starter roles instead of the built-in roles", async () => {
+    env = setup({
+      policies: { NotesReader: { description: "Read notes.", document: { version: 1, statements: [{ effect: "allow", actions: ["notes:list"] }] } } },
+      starterRoles: { reader: { description: "Reads notes.", policies: ["NotesReader"] } },
+    });
+    const asRoot = unlock(env.addUser("root@example.com"));
+    const reader = env.addUser("r@example.com");
+    const iam = env.host.client(iamContract);
+    expect((await iam.queries.roles(asRoot, {})).map((r) => r.name)).toEqual(["reader"]);
+    const policies = await iam.queries.policies(asRoot, {});
+    expect(policies.filter((p) => p.managed).map((p) => p.name).sort()).toEqual(["AdministratorAccess", "NotesReader", "ReadOnlyAccess"]);
+    await expect(
+      iam.commands.putPolicy(asRoot, { name: "NotesReader", description: "", document: { version: 1, statements: [] } }),
+    ).rejects.toMatchObject({ status: 400 });
+    await iam.commands.setUserRoles(asRoot, { userId: reader, roles: ["reader"] });
+    expect(env.iam.authorize(unlock(reader), "notes:list")).toBe(true);
+    expect(env.iam.authorize(unlock(reader), "notes:create")).toBe(false);
+
+    expect(() => setup({ policies: { ReadOnlyAccess: { description: "", document: { version: 1, statements: [] } } } })).toThrow(/built in/);
+    expect(() => setup({ starterRoles: { x: { description: "", policies: ["Missing"] } } })).toThrow(/isn't a managed policy/);
   });
 
   it("lets a custom deny override an allow, and protects managed policies", async () => {

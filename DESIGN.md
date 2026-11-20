@@ -398,7 +398,11 @@ Every operation is an **action**: `module:operation` (`notes:list`,
   - IAM's tables are plain data (checked while locked, edited by admins for
     others). Its reads are `vault: false`; its changes need an unlocked vault,
     so a stolen cookie can't grant itself access.
-  - `createIam({ accounts, rootEmail?, defaultRoles?, oidc? })` returns
+  - Apps can add their own managed policies (`policies`, kept matching the
+    code on every boot, not editable in the UI) and replace the starter
+    roles (`starterRoles`, fresh installs only, policies must be managed),
+    e.g. an `admin` role without IAM rights.
+  - `createIam({ accounts, rootEmail?, defaultRoles?, policies?, starterRoles?, oidc? })` returns
     `{ module, authorize, onLogin }`. `accounts` is vault-service's
     `createAccountStore(db)`, minus `create` for OIDC.
   - `onLogin` (from vault-service's `createAuthRoutes`) maps IdP roles to
