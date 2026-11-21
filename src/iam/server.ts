@@ -39,6 +39,12 @@ export interface IamAccounts {
   revokeInvite?(userId: number): Promise<void>;
   /** Removes every second factor; they set one up again at their next login. */
   resetMfa?(userId: number): Promise<void>;
+  /**
+   * OIDC: replaces the person's roles at the IdP (vault-service's
+   * `accounts.setIdpRoles`). With it and `oidc`, roles picked here are
+   * granted there, so the IdP stays where roles live.
+   */
+  setIdpRoles?(userId: number, roles: readonly string[]): Promise<{ ok: true } | { error: "no-idp" } | { error: "idp"; message: string }>;
 }
 
 /** What `invites.send` gets: everything for the email, including the one-time link. */
@@ -244,6 +250,35 @@ export function createIam(options: IamOptions) {
     return { link, expiresAt: mail.expiresAt, emailed: false };
   };
 
+  /**
+   * Roles live at the IdP: what an admin picks here is granted there (the IdP
+   * roles mapped to these IAM roles) and recorded as the IdP's, which the next
+   * login confirms. Changing it at the IdP still changes it here.
+   */
+  const rolesAtIdp = () => options.oidc !== undefined && options.accounts.setIdpRoles !== undefined;
+  /** IAM roles -> the IdP roles that map to them (the first, when several do). */
+  const toIdpRoles = (roles: readonly string[]) => {
+    const entries = Object.entries(options.oidc!.roleMap);
+    const missing = roles.filter((role) => !entries.some(([, mapped]) => mapped === role));
+    if (missing.length > 0) throw new OperationError(400, `not in the OIDC role map, so the identity provider can't grant it: ${missing.join(", ")}`);
+    return [...new Set(roles.map((role) => entries.find(([, mapped]) => mapped === role)![0]))];
+  };
+  /** Grants the roles at the IdP. False when the account has no login there (its roles then stay manual). */
+  const pushRoles = async (userId: number, roles: readonly string[]): Promise<boolean> => {
+    const result = await options.accounts.setIdpRoles!(userId, toIdpRoles(roles));
+    if ("error" in result) {
+      if (result.error === "no-idp") return false;
+      throw new OperationError(502, `the identity provider refused the roles: ${result.message}`);
+    }
+    const sql = db();
+    sql.transaction(() => {
+      sql.prepare("DELETE FROM iam_user_role WHERE user_id = ?").run(userId);
+      for (const role of new Set(roles)) sql.prepare("INSERT INTO iam_user_role (user_id, role, source) VALUES (?, ?, 'oidc')").run(userId, role);
+    })();
+    changed();
+    return true;
+  };
+
   const roleNames = () => new Set((db().prepare("SELECT name FROM iam_role").all() as { name: string }[]).map((r) => r.name));
   const assertRolesExist = (roles: readonly string[]) => {
     const known = roleNames();
@@ -342,6 +377,7 @@ export function createIam(options: IamOptions) {
             canInvite: canInvite(),
             emailsInvites: canInvite() && options.invites?.send !== undefined,
             canResetMfa: options.accounts.resetMfa !== undefined,
+            rolesAtIdp: rolesAtIdp(),
           }),
         },
         commands: {
@@ -351,12 +387,22 @@ export function createIam(options: IamOptions) {
             const displayName = input.displayName?.trim() || input.email;
             if (input.password === undefined) {
               if (!canInvite()) throw new OperationError(400, "invites aren't set up here");
+              if (rolesAtIdp()) toIdpRoles(input.roles); // refused before anything is created
               const result = await options.accounts.invite!({ email: input.email, displayName });
               if ("error" in result) {
                 if (result.error === "idp") throw new OperationError(502, `the identity provider refused: ${result.message}`);
                 throw new OperationError(409, "an account with that email already exists");
               }
-              replaceRoles(result.id, "manual", input.roles);
+              let granted = false;
+              if (rolesAtIdp()) {
+                try {
+                  granted = await pushRoles(result.id, input.roles);
+                } catch (error) {
+                  const why = error instanceof OperationError ? error.message : String(error);
+                  throw new OperationError(502, `the account was made, but ${why}. Set their roles under Manage, then send a new invite link.`);
+                }
+              }
+              if (!granted) replaceRoles(result.id, "manual", input.roles);
               return { id: result.id, invite: await deliver(call, { userId: result.id, email: input.email, displayName }, result.token, result.expiresAt, false) };
             }
             if (!options.accounts.create) throw new OperationError(400, "accounts with a password can't be created here");
@@ -408,9 +454,10 @@ export function createIam(options: IamOptions) {
             if ("error" in result) throw new OperationError(400, "this account has no password login (it signs in through the identity provider)");
             return {};
           },
-          setUserRoles: (_call, { userId, roles }) => {
+          setUserRoles: async (_call, { userId, roles }) => {
             seed();
             assertRolesExist(roles);
+            if (rolesAtIdp() && (await pushRoles(userId, roles))) return {};
             replaceRoles(userId, "manual", roles);
             return {};
           },

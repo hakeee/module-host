@@ -458,6 +458,11 @@ Every operation is an **action**: `module:operation` (`notes:list`,
     it. `send` emails the link as the admin (the app's mail module); without
     it, or when it fails, the admin is shown the link once to pass on.
     `users` reports `login`, `mfa` and the latest `invite`'s state.
+  - **Roles at the IdP:** with `oidc` and `accounts.setIdpRoles`, roles picked
+    in the admin UI (invite, `setUserRoles`) are granted at the IdP (each IAM
+    role through the first IdP role mapping to it; unmapped roles are refused)
+    and stored as source `oidc`, replacing manual ones. The next login's
+    claims still decide. Accounts without an IdP login keep manual roles.
   - `onLogin` (from vault-service's `createAuthRoutes`) maps IdP roles to
     IAM roles at each login (`oidc.roleMap`; the Zitadel roles claim by
     default) and gives signups `defaultRoles`.

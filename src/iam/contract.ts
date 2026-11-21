@@ -104,6 +104,8 @@ export const iamContract = defineContract({
         /** The app emails invite links itself; otherwise the admin passes the link on. */
         emailsInvites: z.boolean(),
         canResetMfa: z.boolean(),
+        /** OIDC: roles set here are granted at the identity provider too (see `IamAccounts.setIdpRoles`). */
+        rolesAtIdp: z.boolean(),
       }),
       vault: false,
     },

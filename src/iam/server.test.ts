@@ -274,6 +274,54 @@ describe("IAM", () => {
     expect(accountCalls).toEqual([`resetMfa ${user}`]);
   });
 
+  it("grants roles at the IdP when it can, and keeps them as the IdP's", async () => {
+    const pushed: string[] = [];
+    let refuse = false;
+    env = setup({
+      invites: { link: (t) => `https://app.example/invite/${t}` },
+      accounts: {
+        list: () => env.sqlite.prepare("SELECT id, email, display_name AS displayName FROM user ORDER BY id").all() as IamAccount[],
+        invite: async (input: { email: string; displayName: string }) => {
+          const r = env.sqlite.prepare("INSERT INTO user (email, display_name) VALUES (?, ?)").run(input.email, input.displayName);
+          return { id: Number(r.lastInsertRowid), token: "tok", expiresAt: new Date("2030-01-01T00:00:00Z") };
+        },
+        setIdpRoles: async (userId: number, roles: readonly string[]) => {
+          if (userId === 50) return { error: "no-idp" as const };
+          if (refuse) return { error: "idp" as const, message: "403 missing user.grant.write" };
+          pushed.push(`${userId}: ${roles.join(",")}`);
+          return { ok: true as const };
+        },
+      },
+      oidc: { roleMap: { "app-admin": "admin", "app-member": "member" } },
+    });
+    const root = env.addUser("root@example.com");
+    const iam = env.host.client(iamContract);
+    const asRoot = unlock(root);
+    expect((await iam.queries.settings(asRoot, {})).rolesAtIdp).toBe(true);
+
+    const { id } = await iam.commands.createUser(asRoot, { email: "n@example.com", roles: ["member"] });
+    expect(pushed).toEqual([`${id}: app-member`]);
+    const rolesOf = async (userId: number) => (await iam.queries.users(asRoot, {})).find((u) => u.id === userId)!.roles;
+    expect(await rolesOf(id)).toEqual([{ name: "member", source: "oidc" }]);
+
+    await iam.commands.setUserRoles(asRoot, { userId: id, roles: ["admin", "member"] });
+    expect(pushed.at(-1)).toBe(`${id}: app-admin,app-member`);
+    expect(await rolesOf(id)).toEqual([{ name: "admin", source: "oidc" }, { name: "member", source: "oidc" }]);
+
+    // The next login's claims stay in charge: the IdP took admin away.
+    env.iam.onLogin({ userId: id, created: false, provider: "oidc", claims: { "urn:zitadel:iam:org:project:1:roles": { "app-member": {} } } });
+    expect(await rolesOf(id)).toEqual([{ name: "member", source: "oidc" }]);
+
+    // A role the IdP can't grant is refused before anyone is created.
+    await iam.commands.putRole(asRoot, { name: "local", description: "", policies: ["ReadOnlyAccess"] });
+    await expect(iam.commands.createUser(asRoot, { email: "x@example.com", roles: ["local"] })).rejects.toMatchObject({ status: 400 });
+    expect((await iam.queries.users(asRoot, {})).map((u) => u.email)).not.toContain("x@example.com");
+
+    refuse = true;
+    await expect(iam.commands.setUserRoles(asRoot, { userId: id, roles: ["admin"] })).rejects.toMatchObject({ status: 502 });
+    expect(await rolesOf(id)).toEqual([{ name: "member", source: "oidc" }]); // unchanged
+  });
+
   it("maps OIDC roles at each login, and gives signups the default roles", async () => {
     env.addUser("root@example.com");
     const user = env.addUser("o@example.com");
