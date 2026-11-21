@@ -65,6 +65,21 @@ function setup(options: Partial<Parameters<typeof createIam>[0]> = {}) {
       accountCalls.push(`reset ${userId}`);
       return userId === 99 ? ({ error: "no-local-login" } as const) : ({ ok: true } as const);
     },
+    async invite(input: { email: string; displayName: string }) {
+      if (input.email.endsWith("@refused.example")) return { error: "idp" as const, message: "user already exists" };
+      const created = await accounts.create({ ...input, password: "" });
+      return "error" in created ? created : { ...created, token: `t${created.id}`, expiresAt: new Date("2030-01-01T00:00:00Z") };
+    },
+    async reinvite(userId: number) {
+      accountCalls.push(`reinvite ${userId}`);
+      return userId === 98 ? ({ error: "accepted" } as const) : { token: `t${userId}b`, expiresAt: new Date("2030-01-02T00:00:00Z") };
+    },
+    async revokeInvite(userId: number) {
+      accountCalls.push(`revokeInvite ${userId}`);
+    },
+    async resetMfa(userId: number) {
+      accountCalls.push(`resetMfa ${userId}`);
+    },
   };
   const iam = createIam({ accounts, defaultRoles: ["member"], oidc: { roleMap: { "app-admin": "admin" } }, ...options });
   const host = createServerHost({
@@ -205,6 +220,59 @@ describe("IAM", () => {
     });
   });
 
+  it("creates accounts by invite: emailed when the app can, otherwise the admin gets the link", async () => {
+    accountCalls.length = 0;
+    const sent: unknown[] = [];
+    const link = (token: string) => `https://app.example/invite/${token}`;
+    const asRoot = () => unlock(1);
+
+    // Without `invites`, there's nothing to invite with.
+    env.addUser("root@example.com");
+    await expect(env.host.client(iamContract).commands.createUser(asRoot(), { email: "x@example.com", roles: [] })).rejects.toMatchObject({ status: 400 });
+    expect(await env.host.client(iamContract).queries.settings(asRoot(), {})).toMatchObject({ canInvite: false, emailsInvites: false, canResetMfa: true });
+
+    env = setup({ invites: { link, send: async (_call, mail) => void sent.push(mail) } });
+    env.addUser("root@example.com");
+    const iam = env.host.client(iamContract);
+    expect(await iam.queries.settings(asRoot(), {})).toMatchObject({ canInvite: true, emailsInvites: true });
+    const created = await iam.commands.createUser(asRoot(), { email: "new@example.com", displayName: "New", roles: ["member"] });
+    expect(created.invite).toEqual({ link: null, expiresAt: "2030-01-01T00:00:00.000Z", emailed: true }); // nobody but the invitee sees the link
+    expect(sent).toEqual([{ userId: created.id, email: "new@example.com", displayName: "New", link: "https://app.example/invite/t2", expiresAt: "2030-01-01T00:00:00.000Z", again: false }]);
+    expect((await iam.queries.users(asRoot(), {})).find((u) => u.id === created.id)).toMatchObject({ roles: [{ name: "member", source: "manual" }], login: true, mfa: null, invite: null });
+
+    expect(await iam.commands.invite(asRoot(), { userId: created.id })).toMatchObject({ emailed: true, link: null });
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toMatchObject({ again: true, link: "https://app.example/invite/t2b" });
+    await expect(iam.commands.invite(asRoot(), { userId: 1 })).rejects.toMatchObject({ status: 400 }); // root
+    await expect(iam.commands.invite(asRoot(), { userId: 77 })).rejects.toMatchObject({ status: 404 });
+    await expect(iam.commands.createUser(asRoot(), { email: "new@example.com", roles: [] })).rejects.toMatchObject({ status: 409 });
+    await expect(iam.commands.createUser(asRoot(), { email: "a@refused.example", roles: [] })).rejects.toMatchObject({ status: 502 });
+    await iam.commands.revokeInvite(asRoot(), { userId: created.id });
+
+    // A mail server that fails: the admin passes the link on instead.
+    env = setup({ invites: { link, send: async () => Promise.reject(new Error("smtp down")) }, logError: () => {} });
+    env.addUser("root@example.com");
+    expect((await env.host.client(iamContract).commands.createUser(asRoot(), { email: "n@example.com", roles: [] })).invite).toEqual({
+      link: "https://app.example/invite/t2",
+      expiresAt: "2030-01-01T00:00:00.000Z",
+      emailed: false,
+    });
+    expect(accountCalls).toEqual([`reinvite ${created.id}`, "revokeInvite 2"]);
+  });
+
+  it("resets someone else's MFA, never root's or your own", async () => {
+    accountCalls.length = 0;
+    const root = env.addUser("root@example.com");
+    const admin = env.addUser("admin@example.com");
+    const user = env.addUser("user@example.com");
+    const iam = env.host.client(iamContract);
+    await iam.commands.setUserRoles(unlock(root), { userId: admin, roles: ["admin"] });
+    await iam.commands.resetMfa(unlock(admin), { userId: user });
+    await expect(iam.commands.resetMfa(unlock(admin), { userId: root })).rejects.toMatchObject({ status: 400 });
+    await expect(iam.commands.resetMfa(unlock(admin), { userId: admin })).rejects.toMatchObject({ status: 400 });
+    expect(accountCalls).toEqual([`resetMfa ${user}`]);
+  });
+
   it("maps OIDC roles at each login, and gives signups the default roles", async () => {
     env.addUser("root@example.com");
     const user = env.addUser("o@example.com");
@@ -254,7 +322,7 @@ describe("IAM", () => {
     await expect(iam.commands.resetPassword(asAdmin, { userId: root, password: "temporary1" })).rejects.toMatchObject({ status: 400 });
     await expect(iam.commands.disableUser(asAdmin, { userId: admin })).rejects.toMatchObject({ status: 400 });
     await expect(iam.commands.resetPassword(asAdmin, { userId: 99, password: "temporary1" })).rejects.toMatchObject({ status: 400 });
-    expect(await iam.queries.settings(asAdmin, {})).toEqual({ canCreateUsers: true, canDisableUsers: true, canResetPasswords: true, canRevokeSessions: true });
+    expect(await iam.queries.settings(asAdmin, {})).toMatchObject({ canCreateUsers: true, canDisableUsers: true, canResetPasswords: true, canRevokeSessions: true });
     // A member can't do any of it.
     await expect(iam.commands.revokeSessions(unlock(member), { userId: admin })).rejects.toMatchObject({ status: 403 });
   });

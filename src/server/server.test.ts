@@ -51,6 +51,7 @@ const people = defineServerModule({
       get: (call, { id }) => {
         const row = db.select().from(peopleTable).where(eq(peopleTable.id, id)).get();
         if (id === 999) throw new OperationError(404, "no such person");
+        if (id === 666) throw new Error("SQLITE_ERROR: no such column people_person.secret");
         if (!row || row.userId !== call.userId) return null;
         // An extra field the contract doesn't declare - must be stripped by output validation.
         return { id: row.id, name: call.vault.decryptString("person.name", row.name), secret: "x" } as never;
@@ -246,12 +247,23 @@ describe("calls", () => {
     expect((await rpc("people/rpc/create", { name: "Erik" })).statusCode).toBe(423);
     expect((await rpc("people/rpc/create", { name: "" }, "s1")).statusCode).toBe(400);
     expect((await rpc("people/rpc/nope", {}, "s1")).statusCode).toBe(404);
+    // Names from the URL never reach Object.prototype.
+    for (const name of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+      expect((await rpc(`people/rpc/${name}`, {}, "s1")).statusCode).toBe(404);
+    }
 
     const { id } = (await rpc("people/rpc/create", { name: "Erik" }, "s1")).json();
     const missing = await rpc("people/rpc/get", { id: 999 }, "s1");
     expect(missing.statusCode).toBe(404);
     expect(missing.json()).toEqual({ error: "no such person" });
     expect((await rpc("people/rpc/get", { id }, "s1")).json()).toEqual({ id, name: "Erik" }); // `secret` stripped
+    const logError = vi.fn();
+    const quiet = Fastify();
+    await quiet.register(buildHost([journal], { logError }).routes, { prefix: "/m" });
+    const crash = await quiet.inject({ method: "POST", url: "/m/people/rpc/get", payload: { id: 666 }, headers: { "x-session": "s1" } });
+    expect(crash.statusCode).toBe(500);
+    expect(crash.json()).toEqual({ error: "internal error" }); // the message stays in the log
+    expect(logError).toHaveBeenCalledOnce();
 
     const whoami = await app.inject({ method: "GET", url: "/m/journal/whoami", headers: { "x-session": "s1" } });
     expect(whoami.json()).toEqual({ userId: 1, scope: "journal" });

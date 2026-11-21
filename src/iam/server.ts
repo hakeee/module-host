@@ -11,7 +11,14 @@ export interface IamAccount {
   email: string;
   displayName: string;
   disabled?: boolean;
+  /** Has a way to log in. Default true. */
+  login?: boolean;
+  /** Has a second factor; leave out where not tracked. */
+  mfa?: boolean;
+  invite?: { state: "pending" | "expired" | "accepted" | "revoked"; expiresAt: string } | null;
 }
+
+type InviteResult = { token: string; expiresAt: Date } | { error: "not-found" | "accepted" } | { error: "idp"; message: string };
 
 /**
  * Where accounts live - IAM only attaches roles to them. With vault-service:
@@ -25,6 +32,24 @@ export interface IamAccounts {
   enable?(userId: number): Promise<void>;
   revokeSessions?(userId: number): Promise<void>;
   resetPassword?(userId: number, password: string): Promise<{ ok: true } | { error: "no-local-login" }>;
+  /** An account with no login yet, plus a one-time invite token (vault-service's `accounts.invite`). */
+  invite?(input: { email: string; displayName: string }): Promise<{ id: number; token: string; expiresAt: Date } | { error: "email-taken" } | { error: "idp"; message: string }>;
+  /** A fresh token for an invite not yet accepted; earlier ones stop working. */
+  reinvite?(userId: number): Promise<InviteResult>;
+  revokeInvite?(userId: number): Promise<void>;
+  /** Removes every second factor; they set one up again at their next login. */
+  resetMfa?(userId: number): Promise<void>;
+}
+
+/** What `invites.send` gets: everything for the email, including the one-time link. */
+export interface IamInviteMail {
+  userId: number;
+  email: string;
+  displayName: string;
+  link: string;
+  expiresAt: string;
+  /** A resend rather than the first invite. */
+  again: boolean;
 }
 
 /** What vault-service's `onLogin` hands over (see `createAuthRoutes`). */
@@ -61,6 +86,14 @@ export interface IamOptions {
    * understands Zitadel's `urn:zitadel:iam:org:project[:<id>]:roles` claim.
    */
   oidc?: { roleMap: Readonly<Record<string, string>>; rolesFromClaims?: (claims: Record<string, unknown>) => string[] };
+  /**
+   * Inviting needs `accounts.invite` and these. `link` turns a token into the
+   * page the person opens (build it from configuration, never a request).
+   * `send` emails it, as the admin who invited; without it, or when it
+   * throws, the admin is shown the link to pass on.
+   */
+  invites?: { link(token: string): string; send?(call: Caller, mail: IamInviteMail): Promise<void> };
+  logError?: (error: unknown, message: string) => void;
 }
 
 interface Raw {
@@ -188,10 +221,27 @@ export function createIam(options: IamOptions) {
     if (userId === root()) throw new OperationError(400, `root can't be ${what}`);
     if (notSelf && userId === callerId) throw new OperationError(400, `you can't ${what.replace(/d$/, "")} yourself`);
   };
-  const need = <K extends "disable" | "enable" | "revokeSessions" | "resetPassword">(key: K) => {
+  const need = <K extends "disable" | "enable" | "revokeSessions" | "resetPassword" | "reinvite" | "revokeInvite" | "resetMfa">(key: K) => {
     const fn = options.accounts[key];
     if (!fn) throw new OperationError(400, "not supported for these accounts");
     return fn.bind(options.accounts) as NonNullable<IamAccounts[K]>;
+  };
+
+  const canInvite = () => options.accounts.invite !== undefined && options.invites !== undefined;
+  const logError = options.logError ?? ((error, message) => console.error(message, error));
+  /** Emails the link when the app can; otherwise hands it to the admin. */
+  const deliver = async (call: Caller, account: { userId: number; email: string; displayName: string }, token: string, expiresAt: Date, again: boolean) => {
+    const link = options.invites!.link(token);
+    const mail = { ...account, link, expiresAt: expiresAt.toISOString(), again };
+    if (options.invites!.send) {
+      try {
+        await options.invites!.send(call, mail);
+        return { link: null, expiresAt: mail.expiresAt, emailed: true };
+      } catch (error) {
+        logError(error, "iam: sending an invite failed");
+      }
+    }
+    return { link, expiresAt: mail.expiresAt, emailed: false };
   };
 
   const roleNames = () => new Set((db().prepare("SELECT name FROM iam_role").all() as { name: string }[]).map((r) => r.name));
@@ -256,6 +306,9 @@ export function createIam(options: IamOptions) {
               email: a.email,
               displayName: a.displayName,
               disabled: a.disabled ?? false,
+              login: a.login ?? true,
+              mfa: a.mfa ?? null,
+              invite: a.invite ?? null,
               root: a.id === rootUser,
               roles: rows.filter((r) => r.userId === a.id).map((r) => ({ name: r.role, source: r.source })),
             }));
@@ -286,21 +339,54 @@ export function createIam(options: IamOptions) {
             canDisableUsers: options.accounts.disable !== undefined && options.accounts.enable !== undefined,
             canResetPasswords: options.accounts.resetPassword !== undefined,
             canRevokeSessions: options.accounts.revokeSessions !== undefined,
+            canInvite: canInvite(),
+            emailsInvites: canInvite() && options.invites?.send !== undefined,
+            canResetMfa: options.accounts.resetMfa !== undefined,
           }),
         },
         commands: {
-          createUser: async (_call, input) => {
-            if (!options.accounts.create) throw new OperationError(400, "accounts can't be created here");
+          createUser: async (call, input) => {
             seed();
             assertRolesExist(input.roles);
-            const result = await options.accounts.create({
-              email: input.email,
-              password: input.password,
-              displayName: input.displayName?.trim() || input.email,
-            });
+            const displayName = input.displayName?.trim() || input.email;
+            if (input.password === undefined) {
+              if (!canInvite()) throw new OperationError(400, "invites aren't set up here");
+              const result = await options.accounts.invite!({ email: input.email, displayName });
+              if ("error" in result) {
+                if (result.error === "idp") throw new OperationError(502, `the identity provider refused: ${result.message}`);
+                throw new OperationError(409, "an account with that email already exists");
+              }
+              replaceRoles(result.id, "manual", input.roles);
+              return { id: result.id, invite: await deliver(call, { userId: result.id, email: input.email, displayName }, result.token, result.expiresAt, false) };
+            }
+            if (!options.accounts.create) throw new OperationError(400, "accounts with a password can't be created here");
+            const result = await options.accounts.create({ email: input.email, password: input.password, displayName });
             if ("error" in result) throw new OperationError(409, "an account with that email already exists");
             replaceRoles(result.id, "manual", input.roles);
             return { id: result.id };
+          },
+          invite: async (call, { userId }) => {
+            if (!canInvite()) throw new OperationError(400, "invites aren't set up here");
+            assertTarget(call.userId, userId, "invited");
+            const account = (await options.accounts.list()).find((a) => a.id === userId);
+            const result = account ? await need("reinvite")(userId) : ({ error: "not-found" } as const);
+            if ("error" in result) {
+              if (result.error === "idp") throw new OperationError(502, `the identity provider refused: ${result.message}`);
+              if (result.error === "accepted") throw new OperationError(409, "they already accepted their invite");
+              throw new OperationError(404, "no such account");
+            }
+            return deliver(call, { userId, email: account!.email, displayName: account!.displayName }, result.token, result.expiresAt, true);
+          },
+          revokeInvite: async (_call, { userId }) => {
+            await need("revokeInvite")(userId);
+            return {};
+          },
+          resetMfa: async (call, { userId }) => {
+            // Root's second factor is reset only on the server (a CLI command), so a stolen admin session can't strip it.
+            if (userId === root()) throw new OperationError(400, "root's two-step login can only be reset on the server");
+            if (userId === call.userId) throw new OperationError(400, "you can't reset your own two-step login; remove factors on the Security page");
+            await need("resetMfa")(userId);
+            return {};
           },
           disableUser: async (call, { userId }) => {
             assertTarget(call.userId, userId, "disabled", true);

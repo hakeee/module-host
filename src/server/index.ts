@@ -929,6 +929,17 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
         const unsubscribe = options.vaultEvents?.((change) => live.vaultChanged(change));
         if (unsubscribe) app.addHook("onClose", async () => unsubscribe());
       }
+      // Expected failures keep their status; anything else is logged and
+      // answered without its message, which may name tables or paths.
+      app.setErrorHandler((error, _request, reply) => {
+        if (error instanceof ContractInputError) return reply.code(400).send({ error: error.message });
+        if (error instanceof OperationError) return reply.code(error.status).send({ error: error.message });
+        if (error instanceof ModuleVaultLockedError) return reply.code(423).send({ error: "vault locked" });
+        const status = (error as { statusCode?: number }).statusCode;
+        if (status && status >= 400 && status < 500) return reply.code(status).send({ error: (error as Error).message });
+        logError(error, "module-host: request failed");
+        return reply.code(500).send({ error: "internal error" });
+      });
       app.get("/_manifest", async () => ({
         modules: modules.map((m) => ({ id: m.id, contract: m.contract ? { id: m.contract.id, version: m.contract.version } : null })),
       }));

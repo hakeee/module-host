@@ -448,6 +448,11 @@ export function isContract(value: unknown): value is AnyContract {
 }
 
 /** Every query and command of a contract, by name. */
+/**
+ * Every operation of a contract by name. The map has no prototype, so a name
+ * that comes from a URL (`/rpc/constructor`, `/rpc/__proto__`) finds nothing
+ * instead of an inherited Object method.
+ */
 export function operationsOf(contract: AnyContract): Record<string, OperationRef> {
-  return { ...contract.queries, ...contract.commands } as Record<string, OperationRef>;
+  return Object.assign(Object.create(null), contract.queries, contract.commands) as Record<string, OperationRef>;
 }

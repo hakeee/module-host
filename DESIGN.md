@@ -449,18 +449,28 @@ Every operation is an **action**: `module:operation` (`notes:list`,
     code on every boot, not editable in the UI) and replace the starter
     roles (`starterRoles`, fresh installs only, policies must be managed),
     e.g. an `admin` role without IAM rights.
-  - `createIam({ accounts, rootEmail?, defaultRoles?, policies?, starterRoles?, oidc? })` returns
+  - `createIam({ accounts, rootEmail?, defaultRoles?, policies?, starterRoles?, oidc?, invites? })` returns
     `{ module, authorize, onLogin }`. `accounts` is vault-service's
-    `createAccountStore(db)`, minus `create` for OIDC.
+    `createAccountStore(db)`, minus `create` (password accounts) for OIDC.
+  - **Invites:** with `accounts.invite` and `invites: { link(token), send? }`,
+    `iam:createUser` without a password creates the account with no login and
+    a one-time link; `iam:invite` makes a new link, `iam:revokeInvite` cancels
+    it. `send` emails the link as the admin (the app's mail module); without
+    it, or when it fails, the admin is shown the link once to pass on.
+    `users` reports `login`, `mfa` and the latest `invite`'s state.
   - `onLogin` (from vault-service's `createAuthRoutes`) maps IdP roles to
     IAM roles at each login (`oidc.roleMap`; the Zitadel roles claim by
     default) and gives signups `defaultRoles`.
+  - `/m` answers unexpected errors with a bare 500 (`internal error`, the
+    details go to `logError`), and operation names from the URL are looked
+    up without the prototype (`/rpc/constructor` is a 404).
   - The web part is headless (`<IamAccess>`, `useRefreshAccess`). Apps build
     the admin pages for `iamContract.pages` themselves, like they build
     their auth screens.
   - Admin actions on other accounts: `iam:disableUser` / `enableUser`,
     `iam:resetPassword` (login password only; a vault passphrase can't be
-    reset), `iam:revokeSessions`. They never apply to root, and you can't
+    reset), `iam:revokeSessions`, `iam:resetMfa` (their second factors; not
+    your own). They never apply to root, and you can't
     disable yourself. Each needs the matching `accounts` method
     (vault-service's account store has them all).
   - **Self-service actions** (kind `self-service`, passed to the host as

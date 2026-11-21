@@ -20,6 +20,12 @@ export const policyDocumentSchema = z.object({
 const none = z.object({});
 
 /**
+ * A new invite. `link` is only returned when it wasn't emailed, for the
+ * admin to pass on; once the app sends it, nobody but the invitee sees it.
+ */
+const inviteSchema = z.object({ link: z.string().nullable(), expiresAt: z.string(), emailed: z.boolean() });
+
+/**
  * The built-in IAM module's surface. Reads are `vault: false` (it's plain
  * data, and the UI needs permissions while locked); changes need an
  * unlocked vault, so a stolen session cookie alone can't grant itself
@@ -50,6 +56,12 @@ export const iamContract = defineContract({
           displayName: z.string(),
           root: z.boolean(),
           disabled: z.boolean(),
+          /** Has a way to log in (a password or an IdP login). False while an invite is open. */
+          login: z.boolean(),
+          /** Has a second login factor; null where the accounts don't track it. */
+          mfa: z.boolean().nullable(),
+          /** Their latest invite, if they were invited. */
+          invite: z.object({ state: z.enum(["pending", "expired", "accepted", "revoked"]), expiresAt: z.string() }).nullable(),
           roles: z.array(z.object({ name: z.string(), source: z.enum(["manual", "oidc"]) })),
         }),
       ),
@@ -87,20 +99,35 @@ export const iamContract = defineContract({
         canDisableUsers: z.boolean(),
         canResetPasswords: z.boolean(),
         canRevokeSessions: z.boolean(),
+        /** Accounts can be created by invite (a one-time link the person opens). */
+        canInvite: z.boolean(),
+        /** The app emails invite links itself; otherwise the admin passes the link on. */
+        emailsInvites: z.boolean(),
+        canResetMfa: z.boolean(),
       }),
       vault: false,
     },
   },
   commands: {
+    /**
+     * Without `password`, the account is created by invite: no login until
+     * the person opens the link (single mode: sets a password; OIDC: logs in
+     * at the IdP). With one, a temporary password the person changes later.
+     */
     createUser: {
       input: z.object({
         email: z.email(),
-        password: z.string().min(8, "at least 8 characters"),
+        password: z.string().min(8, "at least 8 characters").optional(),
         displayName: z.string().optional(),
         roles: z.array(z.string()),
       }),
-      output: z.object({ id: z.number() }),
+      output: z.object({ id: z.number(), invite: inviteSchema.optional() }),
     },
+    /** A fresh invite link for someone who hasn't accepted theirs yet (the old one stops working). */
+    invite: { input: z.object({ userId: z.number() }), output: inviteSchema },
+    revokeInvite: { input: z.object({ userId: z.number() }), output: none },
+    /** Removes their second factors; they set one up again at their next login. Not root, not yourself. */
+    resetMfa: { input: z.object({ userId: z.number() }), output: none },
     /** No logins; their sessions end everywhere. Not root, not yourself. */
     disableUser: { input: z.object({ userId: z.number() }), output: none },
     enableUser: { input: z.object({ userId: z.number() }), output: none },
