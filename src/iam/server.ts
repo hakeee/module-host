@@ -480,6 +480,12 @@ export function createIam(options: IamOptions) {
       return allowedFor(caller.userId, action, resource);
     },
 
+    /** Whether this account is root (e.g. to keep it out of vault-service's `linkByEmail`). */
+    isRoot(userId: number): boolean {
+      seed();
+      return userId === root();
+    },
+
     /** For vault-service's `onLogin`: OIDC role mapping, and default roles for new signups. */
     onLogin(event: IamLoginEvent): void {
       seed();

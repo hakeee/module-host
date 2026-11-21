@@ -128,6 +128,7 @@ describe("IAM", () => {
   it("makes the first account root, allowed everything; others get nothing without roles", async () => {
     const root = env.addUser("root@example.com");
     const other = env.addUser("other@example.com");
+    expect([env.iam.isRoot(root), env.iam.isRoot(other)]).toEqual([true, false]);
     const rpc = await http(env.host);
     expect((await rpc("notes/rpc/list", root)).statusCode).toBe(423); // allowed, but its vault is locked
     unlock(root);
