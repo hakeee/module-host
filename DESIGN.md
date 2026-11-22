@@ -487,6 +487,14 @@ Every operation is an **action**: `module:operation` (`notes:list`,
   - Permissions decide what someone may *do*. They can't open another
     user's vault: encrypted data stays readable only by its owner, root
     included.
+  - **Audit trail**: the host's `onOperation(event)` hears about every
+    operation a browser calls, after it ran: `{ caller, action, kind,
+    input, outcome, status, ip }`, outcome `ok` / `denied` / `invalid` /
+    `not-found` / `error`. Refusals before the operation (401, 423) and
+    in-process calls between modules aren't reported. `input` is the raw
+    body: keep ids from it, never all of it. Storing the events is the
+    app's business. Invites made without a name get the email's local part
+    (`nameFromEmail`), never the address.
 
 ## Rules that aren't enforced by types (yet)
 

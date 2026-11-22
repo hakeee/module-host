@@ -132,6 +132,9 @@ export function zitadelRoles(claims: Record<string, unknown>): string[] {
  * Users get roles, roles get policies, policies allow or deny actions -
  * see ./policy.ts. Root is allowed everything.
  */
+/** A stand-in name from an email ("jan.novak@x.cz" -> "jan.novak"), for accounts made without one. */
+export const nameFromEmail = (email: string) => email.split("@")[0]!.trim() || "New user";
+
 export function createIam(options: IamOptions) {
   for (const name of Object.keys(options.policies ?? {})) {
     if (name in MANAGED_POLICIES) throw new Error(`IAM: policy "${name}" is built in and can't be redefined`);
@@ -384,7 +387,8 @@ export function createIam(options: IamOptions) {
           createUser: async (call, input) => {
             seed();
             assertRolesExist(input.roles);
-            const displayName = input.displayName?.trim() || input.email;
+            // Never the email itself: names show on schedules, feeds and public booking pages.
+            const displayName = input.displayName?.trim() || nameFromEmail(input.email);
             if (input.password === undefined) {
               if (!canInvite()) throw new OperationError(400, "invites aren't set up here");
               if (rolesAtIdp()) toIdpRoles(input.roles); // refused before anything is created

@@ -387,6 +387,29 @@ export interface ServerHostOptions {
   requirePrivacy?: boolean;
   /** Per-IP limit for `publicRoutes` (default 120 requests a minute; IPv6 counted per /64); over it, a 429. */
   publicRateLimit?: { max: number; windowMs: number };
+  /**
+   * Called after every operation a browser calls (`/rpc`), with how it
+   * ended: for an audit trail. Not called for in-process calls between
+   * modules, nor for calls refused before they reached the operation (no
+   * login: 401, locked vault: 423). `input` is the raw body, unvalidated:
+   * pick out ids, never store it whole (it can hold passwords). A throwing
+   * hook is logged and doesn't change the response.
+   */
+  onOperation?: (event: OperationEvent) => void;
+}
+
+/** One browser call to an operation, for `onOperation`. */
+export interface OperationEvent {
+  caller: Caller;
+  /** `module:operation`, as IAM checks it. */
+  action: string;
+  kind: "query" | "command";
+  input: unknown;
+  /** ok (2xx), denied (403), invalid (400), not-found (404), or error (any other status). */
+  outcome: "ok" | "denied" | "invalid" | "not-found" | "error";
+  status: number;
+  /** The client's address (Fastify's `request.ip`, so it honours `trustProxy`). */
+  ip: string;
 }
 
 export interface JobEvent {
@@ -954,6 +977,23 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
               scope.post<{ Params: { op: string } }>("/rpc/:op", async (request, reply) => {
                 const op = ops[request.params.op];
                 if (!op || op.serverOnly) return reply.code(404).send({ error: "unknown operation" });
+                const report = (caller: Caller, status: number) => {
+                  if (!options.onOperation) return;
+                  const outcome = status < 300 ? "ok" : status === 403 ? "denied" : status === 400 ? "invalid" : status === 404 ? "not-found" : "error";
+                  try {
+                    options.onOperation({
+                      caller: { userId: caller.userId, sessionId: caller.sessionId },
+                      action: actionOf(op),
+                      kind: request.params.op in (module.contract!.commands ?? {}) ? "command" : "query",
+                      input: request.body,
+                      outcome,
+                      status,
+                      ip: request.ip,
+                    });
+                  } catch (error) {
+                    logError(error, "module-host: onOperation failed");
+                  }
+                };
                 let call: CallContext;
                 if (runsLocked(op)) {
                   const caller = options.requireCaller!(request, reply);
@@ -966,15 +1006,19 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
                 }
                 try {
                   const result = await invoke(runtime, op, call, request.body ?? {});
+                  report(call, 200);
                   // Serialized here: Fastify sends a bare string as text/plain, which the browser can't parse as JSON.
                   return reply.type("application/json; charset=utf-8").send(JSON.stringify(result));
                 } catch (error) {
                   if (error instanceof ContractInputError) {
+                    report(call, 400);
                     return reply.code(400).send({ error: error.message });
                   }
                   if (error instanceof OperationError) {
+                    report(call, error.status);
                     return reply.code(error.status).send({ error: error.message });
                   }
+                  report(call, error instanceof ModuleVaultLockedError ? 423 : 500);
                   throw error;
                 }
               });
