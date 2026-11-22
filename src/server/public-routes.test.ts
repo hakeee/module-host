@@ -6,6 +6,7 @@ import { z } from "zod";
 import { defineContract } from "../contract.js";
 import { OperationError } from "../index.js";
 import { createServerHost, defineServerModule } from "./index.js";
+import { ipBucket } from "./ipBucket.js";
 
 const notesContract = defineContract({
   id: "notes",
@@ -68,5 +69,25 @@ describe("public routes", () => {
     const codes = [];
     for (let i = 0; i < 4; i++) codes.push((await app.inject({ method: "GET", url: "/p/feeds/secret" })).statusCode);
     expect(codes).toEqual([200, 200, 200, 429]);
+  });
+
+  it("counts IPv6 clients by their /64", async () => {
+    const app = await setup(true);
+    const from = (remoteAddress: string) => app.inject({ method: "GET", url: "/p/feeds/secret", remoteAddress });
+    const codes = [];
+    for (let i = 1; i <= 4; i++) codes.push((await from(`2001:db8:1:2::${i}`)).statusCode);
+    expect(codes).toEqual([200, 200, 200, 429]);
+    expect((await from("2001:db8:1:3::1")).statusCode).toBe(200);
+  });
+});
+
+describe("ipBucket", () => {
+  it("keeps IPv4 addresses (plain or mapped) and counts IPv6 by /64", () => {
+    expect(ipBucket("203.0.113.7")).toBe("203.0.113.7");
+    expect(ipBucket("::ffff:203.0.113.7")).toBe("203.0.113.7");
+    expect(ipBucket("2001:db8:1:2:aaaa:bbbb:cccc:dddd")).toBe("2001:db8:1:2::/64");
+    expect(ipBucket("2001:0db8:0001:0002:ffff::9")).toBe("2001:db8:1:2::/64");
+    expect(ipBucket("2001:db8::1")).toBe("2001:db8:0:0::/64");
+    expect(ipBucket("::1.2.3.4")).toBe("0:0:0:0::/64");
   });
 });

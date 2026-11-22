@@ -130,7 +130,7 @@ export default defineServerModule({
   webhooks, booking pages. The app mounts `host.publicRoutes` under its own
   prefix (e.g. `/p`), *outside* its auth hook, and the module authenticates
   each request itself (a secret token, a signature). The host rate-limits
-  them per IP (`publicRateLimit`, default 120 a minute) and turns an
+  them per IP (`publicRateLimit`, default 120 a minute; IPv6 per /64) and turns an
   `OperationError` into its status. To act as a user, call operations with
   `{ userId, sessionId }`: they go through IAM like any other call, so a
   feed shows only what its owner may see. Only `vault: false` operations

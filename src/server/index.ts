@@ -25,6 +25,7 @@ import { createRemoteInvoker, registerInternalRoutes, relayLive, type RemoteDef 
 import { JOBS_TABLE, createJobStore, retryDelayMs, type JobRow, type JobStore, type RawSqlite } from "./jobs.js";
 import { createLiveHub, type LiveHub, type LiveMessage, type VaultChange } from "./live.js";
 import { checkTables } from "./tables.js";
+import { ipBucket } from "./ipBucket.js";
 
 export { checkTables, tablesOf } from "./tables.js";
 export type { Caller, Client } from "../client.js";
@@ -384,7 +385,7 @@ export interface ServerHostOptions {
    * (`ctx.privacy.none`). Off by default.
    */
   requirePrivacy?: boolean;
-  /** Per-IP limit for `publicRoutes` (default 120 requests a minute); over it, a 429. */
+  /** Per-IP limit for `publicRoutes` (default 120 requests a minute; IPv6 counted per /64); over it, a 429. */
   publicRateLimit?: { max: number; windowMs: number };
 }
 
@@ -1025,8 +1026,9 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
         const now = Date.now();
         // Drop expired buckets now and then so the map can't grow without bound.
         if (hits.size > 10_000) for (const [ip, h] of hits) if (h.resetAt <= now) hits.delete(ip);
-        const bucket = hits.get(request.ip);
-        if (!bucket || bucket.resetAt <= now) hits.set(request.ip, { count: 1, resetAt: now + windowMs });
+        const key = ipBucket(request.ip);
+        const bucket = hits.get(key);
+        if (!bucket || bucket.resetAt <= now) hits.set(key, { count: 1, resetAt: now + windowMs });
         else if (++bucket.count > max) return reply.code(429).header("retry-after", Math.ceil((bucket.resetAt - now) / 1000)).send({ error: "too many requests" });
       });
       app.setErrorHandler((error, _request, reply) => {
