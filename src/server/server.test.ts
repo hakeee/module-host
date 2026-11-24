@@ -310,6 +310,34 @@ describe("calls", () => {
     expect(seenEvents).toEqual([{ module: "journal", id: 42, scopeName: "journal" }]);
     expect(logError).toHaveBeenCalledOnce();
   });
+
+  it("runs subscribers while the emitter's vault is locked; only touching the vault fails", async () => {
+    const logError = vi.fn();
+    const seen: number[] = [];
+    const plain = defineServerModule({
+      id: "plain",
+      requires: [people],
+      setup(ctx) {
+        ctx.on(peopleContract, "created", (call, { id }) => {
+          seen.push(call.userId, id);
+        });
+      },
+    });
+    const needsVault = defineServerModule({
+      id: "needs-vault",
+      requires: [people],
+      setup(ctx) {
+        ctx.on(peopleContract, "created", (call) => {
+          void call.vault.scope;
+        });
+      },
+    });
+    buildHost([plain, needsVault], { logError });
+    await peopleCtx!.emit({ userId: 7, sessionId: "gone" } as never, "created", { id: 1 });
+    expect(seen).toEqual([7, 1]);
+    expect(logError).toHaveBeenCalledOnce();
+    expect(String(logError.mock.calls[0]![0])).toContain("vault locked");
+  });
 });
 
 describe("vault: false operations", () => {

@@ -573,6 +573,22 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
     return buildCall(runtime, caller, vault);
   };
 
+  /**
+   * An event subscriber's context: the vault scope when unlocked; while locked, the caller with a vault that throws
+   * `ModuleVaultLockedError` only when touched, so plain-data work (calling `vault: false` operations) still runs.
+   */
+  const subscriberCall = (runtime: Runtime, caller: Caller): CallContext => {
+    const vault = options.vaultFor(caller.sessionId);
+    if (vault && vault.userId === caller.userId) return buildCall(runtime, caller, vault);
+    const locked = (): never => {
+      throw new ModuleVaultLockedError();
+    };
+    const call = { userId: caller.userId, sessionId: caller.sessionId } as CallContext;
+    Object.defineProperty(call, "vault", { get: locked, enumerable: false });
+    if (runtime.module.def.legacyEncryption) Object.defineProperty(call, "legacy", { get: locked, enumerable: false });
+    return call;
+  };
+
   /** The context an operation's handler gets: just the caller for `vault: false`, else the vault scope (or a locked error). */
   const callForOp = (runtime: Runtime, op: OperationRef, caller: Caller): CallContext =>
     runsLocked(op) ? ({ userId: caller.userId, sessionId: caller.sessionId } as CallContext) : callFor(runtime, caller);
@@ -635,7 +651,7 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
     const payload = await validate(ref.payload, rawPayload, `${contract.id}.${event} event`);
     for (const { runtime, handler } of subscribers.get(`${contract.id}.${event}`) ?? []) {
       try {
-        await handler(callFor(runtime, caller), payload);
+        await handler(subscriberCall(runtime, caller), payload);
       } catch (error) {
         logError(error, `"${runtime.module.id}" failed handling ${contract.id}.${event}`);
       }

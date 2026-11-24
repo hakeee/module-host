@@ -142,7 +142,9 @@ export default defineServerModule({
   readable by anyone holding the login cookie, so it must be plain data.
   It needs the host option `requireCaller` (vault-service's
   `createRequireCaller`), and the host refuses to boot without it.
-- **Events** run in-process after `emit` and are awaited. Each subscriber
+- **Events** run in-process after `emit` and are awaited, also while the
+  emitter's vault is locked: the subscriber's `call.vault` then throws
+  `ModuleVaultLockedError` when touched, so plain-data work still runs. Each subscriber
   gets its own call context. A failing subscriber is logged and doesn't
   fail the emitter.
 - **Privacy (GDPR) hooks.** A module says how to export and how to erase
