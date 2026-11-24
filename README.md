@@ -17,6 +17,18 @@ Read **[DESIGN.md](./DESIGN.md)** first. It covers what a module is, the
 contract format, the database and encryption rules, and the linked-repo
 caveats.
 
+## Installing
+
+Not on npm. Each `v*` tag builds release tarballs on GitHub; depend on the release URL:
+
+```json
+"@hakeee/module-host": "https://github.com/hakeee/module-host/releases/download/v0.1.0/hakeee-module-host-0.1.0.tgz"
+```
+
+Apps that work on this repo alongside install it from a sibling checkout instead (`link:`). The
+release tarballs hold only the build: their `exports` point at `dist/`, while a linked checkout
+resolves the `development` condition to `src/`.
+
 ## Minimal wiring
 
 ```ts
@@ -41,3 +53,7 @@ const host = createWebHost({ modules: [appWeb], baseUrl: `${API}/m` });
 
 Consumers: Ebba (`modules/people`, plus its legacy screens as one module).
 See `ROADMAP.md`.
+
+## License
+
+MIT, see [LICENSE](./LICENSE).

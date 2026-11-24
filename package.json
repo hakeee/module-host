@@ -1,7 +1,6 @@
 {
   "name": "@hakeee/module-host",
   "version": "0.1.0",
-  "private": true,
   "packageManager": "pnpm@11.25.0",
   "engines": {
     "node": ">=24"
@@ -102,5 +101,38 @@
     "typescript": "^6.0.3",
     "vitest": "^5.1.0",
     "zod": "4.6.6"
-  }
+  },
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "./server": {
+        "types": "./dist/server/index.d.ts",
+        "default": "./dist/server/index.js"
+      },
+      "./web": {
+        "types": "./dist/web/index.d.ts",
+        "default": "./dist/web/index.js"
+      },
+      "./iam": {
+        "types": "./dist/iam/index.d.ts",
+        "default": "./dist/iam/index.js"
+      },
+      "./iam/server": {
+        "types": "./dist/iam/server.d.ts",
+        "default": "./dist/iam/server.js"
+      },
+      "./iam/web": {
+        "types": "./dist/iam/web.d.ts",
+        "default": "./dist/iam/web.js"
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hakeee/module-host.git"
+  },
+  "license": "MIT"
 }

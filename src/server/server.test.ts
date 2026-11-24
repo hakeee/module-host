@@ -328,7 +328,7 @@ describe("calls", () => {
       requires: [people],
       setup(ctx) {
         ctx.on(peopleContract, "created", (call) => {
-          void call.vault.scope;
+          void call.vault.name;
         });
       },
     });

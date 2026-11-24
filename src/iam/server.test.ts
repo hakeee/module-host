@@ -68,7 +68,8 @@ function setup(options: Partial<Parameters<typeof createIam>[0]> = {}) {
     async invite(input: { email: string; displayName: string }) {
       if (input.email.endsWith("@refused.example")) return { error: "idp" as const, message: "user already exists" };
       const created = await accounts.create({ ...input, password: "" });
-      return "error" in created ? created : { ...created, token: `t${created.id}`, expiresAt: new Date("2030-01-01T00:00:00Z") };
+      if (created.error) return { error: created.error };
+      return { id: created.id, token: `t${created.id}`, expiresAt: new Date("2030-01-01T00:00:00Z") };
     },
     async reinvite(userId: number) {
       accountCalls.push(`reinvite ${userId}`);
